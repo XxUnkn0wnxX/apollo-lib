@@ -90,17 +90,10 @@ jobs:
           cp build/apollo_patcher_gui dist/
         fi
 
-    - name: Sign and verify macOS outputs
+    - name: Verify macOS Universal2 and deployment targets
       if: matrix.os == 'macos-latest'
       run: |
         chmod 755 tools/patcher tools/dumper gui/dist/apollo_patcher_gui.app/Contents/MacOS/apollo_patcher_gui
-        codesign --force --sign - --timestamp=none tools/patcher
-        codesign --force --sign - --timestamp=none tools/dumper
-        codesign --force --sign - --timestamp=none gui/dist/apollo_patcher_gui.app
-
-        codesign --verify --strict tools/patcher
-        codesign --verify --strict tools/dumper
-        codesign --verify --deep --strict gui/dist/apollo_patcher_gui.app
 
         verify_universal() {
           local file="$1"
