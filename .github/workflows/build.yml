@@ -41,6 +41,8 @@ jobs:
         curl -fsSL https://src.fedoraproject.org/repo/pkgs/mbedtls/mbedtls-2.16.12.tar.gz/sha512/8d96d8cd906cc0999134320e4e1f550631426d166eab5da6e65469ee7286093810fcc6ac4bd5500ee55972d159f8bef7f9e53245f7f0eec72f72c35265b4313b/mbedtls-2.16.12.tar.gz | tar xvz -C ./
         cd mbedtls-2.16.12
         mkdir build
+        # macOS needs Universal2 mbedTLS archives and a macOS 11.0 floor; Linux
+        # keeps the existing native CMake configuration.
         if [ "${{ matrix.os }}" = "macos-latest" ]; then
           cmake -S . -B build \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
@@ -62,6 +64,8 @@ jobs:
       run: |
         cd tools
         make clean
+        # Make receives the SDK, both architectures, and deployment target via CC
+        # so the CLI matches the CMake-built Universal2 components.
         if [ "${{ matrix.os }}" = "macos-latest" ]; then
           make CC="$(xcrun --find clang) -isysroot $(xcrun --sdk macosx --show-sdk-path) -arch x86_64 -arch arm64 -mmacosx-version-min=11.0"
         else
@@ -71,6 +75,8 @@ jobs:
     - name: Build Apollo Patcher GUI
       run: |
         cd gui
+        # Keep the GUI's CMake configuration aligned with Universal2 mbedTLS and
+        # the same macOS 11.0 deployment baseline.
         if [ "${{ matrix.os }}" = "macos-latest" ]; then
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER="$(xcrun --find clang)" \
@@ -90,6 +96,10 @@ jobs:
           cp build/apollo_patcher_gui dist/
         fi
 
+    # Neither gui/CMakeLists.txt nor tools/Makefile sets a deployment target. Use
+    # macOS 11.0, the first Apple Silicon release, as one baseline for both slices.
+    # Fail before upload if a shipped executable or link input loses a CPU slice,
+    # or if a distributable executable raises that baseline.
     - name: Verify macOS Universal2 and deployment targets
       if: matrix.os == 'macos-latest'
       run: |
@@ -106,6 +116,8 @@ jobs:
           local file="$1"
           local arch
           for arch in x86_64 arm64; do
+            # Modern and legacy Mach-O load commands use different fields for
+            # the minimum macOS version.
             if ! otool -arch "$arch" -l "$file" | awk '
               $1 == "cmd" && $2 == "LC_BUILD_VERSION" { build=1; legacy=0; next }
               $1 == "cmd" && $2 == "LC_VERSION_MIN_MACOSX" { legacy=1; build=0; next }
@@ -121,6 +133,8 @@ jobs:
           done
         }
 
+        # Keep this inventory in sync when macOS artifacts or link inputs change.
+        # New shipped executables also need an assert_minos_11 check below.
         verify_universal mbedtls-2.16.12/build/library/libmbedcrypto.a
         verify_universal tools/patcher
         verify_universal tools/dumper
