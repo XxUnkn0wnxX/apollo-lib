@@ -2,12 +2,16 @@ name: Build binaries
 
 on:
   push:
+    branches:
+      - develop
   pull_request:
-  repository_dispatch:
-    types: [run_build]
+    branches:
+      - develop
+  workflow_dispatch:
 
 jobs:
   build:
+    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/develop' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
