@@ -2,7 +2,11 @@ name: Build WebAssembly
 
 on:
   push:
+    branches:
+      - develop
   pull_request:
+    branches:
+      - develop
   repository_dispatch:
     types: [run_build]
 
