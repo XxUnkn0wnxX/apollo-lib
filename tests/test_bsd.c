@@ -1,29 +1,40 @@
 /*
  * BSD script vectors.
  *
- * BSD is fully build-flag-invariant: reads/writes go through the unconditional
- * BE* macros, and host-native integer truncation goes through HOST_LSB (which
- * depends only on the real host byte order, the same in both LE and __PS3_PC__
- * builds). So every BSD vector uses a single shared expected array, and the
- * two builds must agree.
+ * BSD is fully endian-mode-invariant: reads and writes go through the
+ * unconditional BE* macros, and integer truncation goes through
+ * _set_var_slice(), which lays the value out big-endian and hands it to
+ * _swap_var_endianness(). So every BSD vector uses a single shared expected
+ * array, and the two passes must agree.
  *
- * Note: carry()-based checksum truncation (wadd/dwadd/add/sub) originally used
- * the target-endian PADDING macro and produced WRONG, divergent output in the
- * __PS3_PC__ build (it sliced the high half of the accumulator on a
- * little-endian host). That was fixed by switching those sites to HOST_LSB;
- * bsd_carry_padding_truncation() below guards the corrected, invariant result.
+ * Two rounds of fixes are guarded here. First, carry()-based truncation
+ * (wadd/dwadd/add/sub) originally used the target-endian PADDING macro and
+ * produced WRONG, divergent output for big-endian save data -- it sliced the
+ * high half of the accumulator on a little-endian host. That was fixed by
+ * keying the slice on the real HOST byte order instead; the vectors below with
+ * hand-computed accumulators guard the corrected result.
+ *
+ * Keying on the host was necessary but not sufficient. It picks the right
+ * BYTES on either host and leaves them in host ORDER, which only the widths
+ * the variable reader converts (2, 4, 8) ever recover from -- so a 3-byte
+ * slice still came out reversed between a PS3 and a wasm build, and was
+ * unreachable to test. _set_var_slice() closed that, and
+ * bsd_carry_truncation_is_big_endian() and
+ * bsd_left_right_slices_are_big_endian() pin every width.
  * See tests/README.md.
  */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "test_common.h"
 
 /* returns new size; *buf may be realloc'd by insert/delete */
 static size_t apply_bsd(uint8_t** buf, size_t len, const char* codes)
 {
-    free_patch_var_list();               /* isolate variable state per test */
+    apollo_free_var_list();               /* isolate variable state per test */
     code_entry_t c = make_bsd_code(codes);
-    return apply_bsd_patch_code(buf, len, &c);
+    return apollo_apply_bsd_code(buf, len, &c);
 }
 
 static uint8_t* dup_bytes(const uint8_t* src, size_t len)
@@ -63,6 +74,39 @@ TEST(bsd_write_next_pointer)
     free(buf);
 }
 
+/* set pointer:read(addr,len) takes the pointer from the save, big-endian. If
+ * either argument does not parse, nothing is read and the pointer is 0: each
+ * malformed form below used to land somewhere the save chose instead --
+ * read(foo,4) at offset 0's value (0xC), read(4,zz) at offset 4's (0x8). */
+TEST(bsd_set_pointer_read)
+{
+    static const struct { const char* arg; size_t at; } cases[] = {
+        { "read(0,4)",   0xC },
+        { "read(4,4)",   0x8 },
+        { "read(foo,4)", 0x0 },
+        { "read(4,zz)",  0x0 },
+    };
+    uint8_t init[16] = {0};
+    init[3] = 0x0C;
+    init[7] = 0x08;
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+        char script[64];
+        snprintf(script, sizeof(script), "set pointer:%s\nwrite next 0:EE", cases[i].arg);
+
+        uint8_t* buf = dup_bytes(init, sizeof(init));
+        size_t n = apply_bsd(&buf, sizeof(init), script);
+
+        uint8_t exp[16];
+        memcpy(exp, init, sizeof(exp));
+        exp[cases[i].at] = 0xEE;
+        CHECK_U64("set pointer:read: size unchanged", n, sizeof(init));
+        CHECK_MEM("set pointer:read: write lands at the read pointer", buf, exp, sizeof(exp));
+        free(buf);
+    }
+}
+
 /* repeat(count,value) */
 TEST(bsd_write_repeat)
 {
@@ -95,14 +139,12 @@ TEST(bsd_insert)
 
 /*
  * carry()-based checksum truncation must be host-consistent and therefore
- * identical in both builds (regression guard for the PADDING -> HOST_LSB fix).
+ * identical in both builds (regression guard for the PADDING fix).
  *
  * wadd(0x0,0x3) over {12 34 56 78} = be16(0x1234)+be16(0x5678) = 0x000068AC.
- * In little-endian host memory that u32 is [AC 68 00 00]. carry(2) keeps the
- * low 16 bits (HOST_LSB=0 on a little-endian host, in BOTH builds), which the
- * write path then emits big-endian as [68 AC]. This matches what a real PS3
- * (__PPU__) and a real PS4/PC produce; before the fix the __PS3_PC__ build
- * wrongly kept the high half and wrote [00 00].
+ * carry(2) keeps the LOW 16 bits, 0x68AC, which reaches the file big-endian as
+ * [68 AC]. That is what a real PS3 and a real PS4/PC produce; before the fix
+ * the __PS3_PC__ build wrongly kept the high half and wrote [00 00].
  */
 TEST(bsd_carry_padding_truncation)
 {
@@ -115,15 +157,15 @@ TEST(bsd_carry_padding_truncation)
     uint8_t exp[16] = {0};
     memcpy(exp, init, 4);
     exp[8]=0x68; exp[9]=0xAC;   /* low half 0x68AC, emitted big-endian; same in LE and BE */
-    CHECK_MEM("wadd carry(2) truncation (HOST_LSB)", buf, exp, sizeof(exp));
+    CHECK_MEM("wadd carry(2) truncation", buf, exp, sizeof(exp));
     free(buf);
 }
 
 /*
- * add() with carry — the second HOST_LSB site (patches.c add handler).
+ * add() with carry — the second truncation site (patches.c add handler).
  * add(0x0,0x3) = 0xFF+0xFF+0xFF+0x04 = 0x00000301. carry(2) keeps the low 16
- * bits 0x0301 (HOST_LSB=0 on the host), emitted big-endian as [03 01] in both
- * builds. Before the fix the __PS3_PC__ build kept the high half -> [00 00].
+ * bits 0x0301, emitted big-endian as [03 01] in both modes. Before the fix the
+ * big-endian build kept the high half -> [00 00].
  */
 TEST(bsd_add_carry_truncation)
 {
@@ -136,15 +178,16 @@ TEST(bsd_add_carry_truncation)
     uint8_t exp[16] = {0};
     memcpy(exp, init, 4);
     exp[8]=0x03; exp[9]=0x01;
-    CHECK_MEM("add carry(2) truncation (HOST_LSB)", buf, exp, sizeof(exp));
+    CHECK_MEM("add carry(2) truncation", buf, exp, sizeof(exp));
     free(buf);
 }
 
 /*
- * right(value,len) — the third HOST_LSB site. Keeps the `len` rightmost
+ * right(value,len) — the third truncation site. Keeps the `len` rightmost
  * (least-significant) bytes of the value. right(0x12345678,2) -> 0x5678,
- * emitted big-endian as [56 78] in both builds. Before the fix the __PS3_PC__
- * build kept the LEFT bytes -> [12 34].
+ * emitted big-endian as [56 78] in both modes. Before the fix the big-endian
+ * build kept the LEFT bytes -> [12 34]. Width coverage beyond 2 bytes lives in
+ * bsd_left_right_slices_are_big_endian().
  */
 TEST(bsd_right_truncation)
 {
@@ -155,16 +198,15 @@ TEST(bsd_right_truncation)
 
     uint8_t exp[16] = {0};
     exp[0]=0x56; exp[1]=0x78;
-    CHECK_MEM("right(v,2) keeps low bytes (HOST_LSB)", buf, exp, sizeof(exp));
+    CHECK_MEM("right(v,2) keeps low bytes", buf, exp, sizeof(exp));
     free(buf);
 }
 
 /*
  * left(value,len) — keeps the leftmost / MOST-significant `len` bytes of the
- * value, host-consistently (via HOST_MSB), emitted big-endian by the write
- * path. left(0x00012345,2) -> the top 2 bytes 0x0001 -> [00 01] in every build.
- * Before the HOST_MSB fix the little-endian builds wrongly kept the low bytes
- * (0x2345 -> [23 45], identical to right()).
+ * value, emitted big-endian by the write path. left(0x00012345,2) -> the top 2
+ * bytes 0x0001 -> [00 01] in every build. Before the fix the little-endian
+ * builds wrongly kept the low bytes (0x2345 -> [23 45], identical to right()).
  */
 TEST(bsd_left)
 {
@@ -215,15 +257,17 @@ TEST(bsd_mid_offset)
 }
 
 /*
- * Update of an already-existing variable — the fourth HOST_LSB site
- * (patches.c:796, where an existing var's value is re-fetched into old_val and
- * var->data is re-pointed at its low bytes). The var is created with read()
- * (not a HOST_LSB site) so ONLY line 796 is under test here.
+ * Update of an already-existing variable — the fourth truncation site, where a
+ * var's value is re-fetched into old_val and re-stored. The var is created
+ * with read(), which is not a truncation site, so only the re-fetch is under
+ * test here.
  *
- * read(0,2) of file bytes {AA BB} stores the big-endian value 0xAABB. The
- * second set re-fetches it (line 796 -> low bytes), endian_swap reverses to
- * 0xBBAA, and write emits it big-endian as [BB AA]. Same in both builds; before
- * the fix the __PS3_PC__ build re-pointed at the high (zero) bytes -> [00 00].
+ * read(0,2) of file bytes {AA BB} stores the value 0xAABB. The second set
+ * re-fetches it (now via _get_var_value(), re-stored via _set_var_slice()),
+ * endian_swap reverses it to 0xBBAA, and write emits it big-endian as [BB AA].
+ * Same in both modes; before the fix the big-endian build re-pointed at the
+ * high (zero) bytes -> [00 00]. The 3-byte width this pair has to survive is
+ * covered by the two-step accumulate in bsd_carry_truncation_is_big_endian().
  */
 TEST(bsd_update_existing_variable)
 {
@@ -237,7 +281,65 @@ TEST(bsd_update_existing_variable)
     uint8_t exp[16] = {0};
     exp[0]=0xAA; exp[1]=0xBB;    /* untouched source */
     exp[4]=0xBB; exp[5]=0xAA;    /* re-fetched, swapped, written big-endian */
-    CHECK_MEM("existing-var re-fetch truncation (HOST_LSB)", buf, exp, sizeof(exp));
+    CHECK_MEM("existing-var re-fetch truncation", buf, exp, sizeof(exp));
+    free(buf);
+}
+
+/*
+ * A "[name]" reference must match the whole variable name, not a prefix of it.
+ *
+ * Both lookups resolve the name straight out of the script line, from the span
+ * between the brackets, so the comparison is length-delimited (strncmp) rather
+ * than a strcmp over a NUL-terminated copy. strncmp alone only answers "does
+ * the stored name START with this span", so the lookup also has to check that
+ * the stored name ends there.
+ *
+ * Without that check, declaring [ab] and then [a] does not produce two
+ * variables at all: the declaration of [a] goes through the same lookup, finds
+ * [ab], and overwrites it. So the tell is a later reference to the LONGER name
+ * reading back the shorter one's value. Both vectors below are built that way,
+ * and both cover one of the two call sites: value decoding
+ * (_decode_variable_data) and integer parsing (_parse_int_value).
+ *
+ * The values are 1 and 3 bytes wide on purpose. A 2/4/8-byte variable is
+ * converted to big-endian on its way out, which would fold an endianness
+ * question into a name-resolution test.
+ */
+TEST(bsd_var_name_prefix_not_matched_as_value)
+{
+    uint8_t init[16] = {0};
+    uint8_t* buf = dup_bytes(init, sizeof(init));
+
+    apply_bsd(&buf, sizeof(init),
+              "set [ab]:AABBCC\nset [a]:112233\nwrite at 0:[a]\nwrite at 8:[ab]");
+
+    uint8_t exp[16] = {0};
+    exp[0]=0x11; exp[1]=0x22; exp[2]=0x33;    /* [a]                          */
+    exp[8]=0xAA; exp[9]=0xBB; exp[10]=0xCC;   /* [ab], not clobbered by [a]   */
+    CHECK_MEM("[a] and [ab] stay distinct variables", buf, exp, sizeof(exp));
+    free(buf);
+}
+
+TEST(bsd_var_name_prefix_not_matched_as_offset)
+{
+    uint8_t init[16];
+    uint8_t* buf;
+
+    for (int i = 0; i < 16; i++) init[i] = (uint8_t) i;   /* 00..0F */
+    buf = dup_bytes(init, sizeof(init));
+
+    /* read([p],1) reads offset 8 and read([pp],1) offset 4, so the two bytes
+     * written back name which variable each reference resolved to. */
+    apply_bsd(&buf, sizeof(init),
+              "set [pp]:0x00000004\nset [p]:0x00000008\n"
+              "set [v]:read([p],1)\nset [w]:read([pp],1)\n"
+              "write at 0:[v]\nwrite at 1:[w]");
+
+    uint8_t exp[16];
+    memcpy(exp, init, sizeof(exp));
+    exp[0]=0x08;                 /* [p]  -> offset 8 */
+    exp[1]=0x04;                 /* [pp] -> offset 4 */
+    CHECK_MEM("[p] and [pp] resolve to their own offsets", buf, exp, sizeof(exp));
     free(buf);
 }
 
@@ -351,6 +453,159 @@ TEST(bsd_hash_sha1)
     free(buf);
 }
 
+/* ======================================================================== */
+/* Fletcher-16 / Fletcher-32                                                */
+/* ======================================================================== */
+
+/*
+ * Published Fletcher check values.
+ *
+ * Fletcher-32 sums 16-bit LITTLE-endian words by definition, and that is fixed
+ * in the implementation rather than taken from the host, so these vectors hold
+ * in both the LE and the BE mode -- which is the property that lets a
+ * savepatch using it produce the same hash on a PS3 as on a PS4.
+ */
+static const struct {
+    const char* s;
+    uint16_t    f16;
+    uint32_t    f32;
+} fletcher_vectors[] = {
+    { "abcde",    0xC8F0, 0xF04FC729 },
+    { "abcdef",   0x2057, 0x56502D2A },
+    { "abcdefgh", 0x0627, 0xEBE19591 },
+};
+
+TEST(hash_fletcher_known_vectors)
+{
+    for (size_t i = 0; i < sizeof(fletcher_vectors) / sizeof(*fletcher_vectors); i++)
+    {
+        const uint8_t* d = (const uint8_t*) fletcher_vectors[i].s;
+        size_t n = strlen(fletcher_vectors[i].s);
+
+        CHECK_U64("fletcher16 published vector",
+                  apollo_hash_fletcher16(d, n), fletcher_vectors[i].f16);
+        CHECK_U64("fletcher32 published vector",
+                  apollo_hash_fletcher32(d, n), fletcher_vectors[i].f32);
+    }
+}
+
+/*
+ * Both functions defer the modulo to the end of a block, sized so c1 cannot
+ * overflow first (5802 bytes / 360 words). This buffer is 6000 bytes, so it
+ * crosses that boundary in both -- a wrong block size or a dropped reduction
+ * diverges here and nowhere in the short vectors above.
+ *
+ * The expected values were computed with exact arbitrary-precision arithmetic
+ * and a single modulo at the very end, i.e. from Fletcher's definition rather
+ * than from a second copy of the blocked algorithm.
+ */
+TEST(hash_fletcher_block_boundary)
+{
+    uint8_t* buf = malloc(6000);
+    size_t i;
+
+    for (i = 0; i < 6000; i++)
+        buf[i] = (uint8_t)(i * 7 + 3);
+
+    CHECK_U64("fletcher16 across the 5802-byte block boundary",
+              apollo_hash_fletcher16(buf, 6000), 0x777F);
+    CHECK_U64("fletcher32 across the 360-word block boundary",
+              apollo_hash_fletcher32(buf, 6000), 0x7921C9B5);
+    free(buf);
+}
+
+/*
+ * An odd length contributes its last byte as the low half of a zero-padded
+ * word. The textbook version rounds the length up and then reads that byte from
+ * the buffer, one past the end of a caller-sized range; ASan catches that here.
+ */
+TEST(hash_fletcher32_odd_length_zero_padded)
+{
+    uint8_t three[3] = { 0x11, 0x22, 0x33 };
+
+    /* words 2211, 0033 */
+    CHECK_U64("fletcher32 odd length", apollo_hash_fletcher32(three, 3), 0x44552244);
+}
+
+/*
+ * DBZ Xenoverse 2: known answers for both branches, so the packing of the
+ * eight one-byte checksums is pinned without the external sample saves.
+ * Expected values worked out by hand from the algorithm (and cross-checked
+ * against an independent transcription), not captured from this engine.
+ *
+ * The value is out[7]..out[0], most significant first, and the patch writes it
+ * big-endian at 0x34, so the save gets out[7] at 0x34 and out[0] at 0x3B --
+ * on every host. Both the number and the bytes are checked, with no
+ * apollo_test_be() branch: the old memcpy() packing was only right on a
+ * little-endian host.
+ */
+static void dbzxv2_case(const uint8_t* init, uint64_t want, const char* label)
+{
+    uint8_t* buf = dup_bytes(init, 0x100);
+    uint8_t exp[8];
+
+    for (int i = 0; i < 8; i++)
+        exp[i] = (uint8_t) (want >> (8 * (7 - i)));
+
+    check_u64(__FILE__, __LINE__, label, apollo_hash_dbzxv2(init, 0x100), want);
+    check_u64(__FILE__, __LINE__, label,
+              apply_bsd(&buf, 0x100, "set [checkdbz]:dbzxv2_checksum\nwrite at 0x0034:[checkdbz]"), 0x100);
+    check_mem(__FILE__, __LINE__, label, buf + 0x34, exp, sizeof(exp));
+    free(buf);
+}
+
+TEST(hash_dbzxv2_known_answers)
+{
+    uint8_t a[0x100] = {0};
+    uint8_t b[0x100] = {0};
+
+    /* 0x34..0x3B all zero: checksum 8 only. out[7] = FF, and out[1] is the
+     * sum of the first byte of every 0x20 block from the 6th on. */
+    a[0xA0] = 0x10; a[0xC0] = 0x20; a[0xE0] = 0x30;
+    dbzxv2_case(a, 0xFF00000000006000ULL, "dbzxv2: checksum-8 branch");
+
+    /* Otherwise all eight. One or two bytes per sum, each a different value,
+     * so a checksum in the wrong slot cannot pass. out[0] wraps (0x80 + 0x90),
+     * and so does out[7] (0xF0 plus the other seven). */
+    b[0x3A] = 0x11;                                     /* out[1], reloaded */
+    b[0x26] = 0x01; b[0x33] = 0x02;                     /* out[6] = 03 */
+    b[0x3C] = 0x04; b[0x58] = 0x05;                     /* out[5] = 09 */
+    b[0x6C] = 0x06; b[0x88] = 0x07;                     /* out[4] = 0D */
+    b[0x5C] = 0x08; b[0x68] = 0x09;                     /* out[3] = 11 */
+    b[0x8C] = 0x0A; b[0x98] = 0x0B;                     /* out[2] = 15 */
+    b[0xA0] = 0x80; b[0xE0] = 0x90;                     /* out[0] = 10 */
+    b[0x25] = 0xF0;                                     /* out[7] = 50 */
+    dbzxv2_case(b, 0x5003090D11151110ULL, "dbzxv2: full branch");
+}
+
+/* An empty range must be well-defined, not a wrapped block length. */
+TEST(hash_fletcher_empty_range)
+{
+    CHECK_U64("fletcher16 of nothing", apollo_hash_fletcher16((const uint8_t*)"", 0), 0);
+    CHECK_U64("fletcher32 of nothing", apollo_hash_fletcher32((const uint8_t*)"", 0), 0);
+}
+
+/* The BSD commands, over "12345678" (8 bytes, so no padding is involved). */
+TEST(bsd_hash_fletcher16)
+{
+    uint8_t* buf = hash_buf();
+    apply_bsd(&buf, 64, "set range:0x0,0x7\nset [h]:fletcher16\nwrite at 0x10:[h]");
+
+    uint8_t exp[2] = { 0x3F, 0xA5 };
+    CHECK_MEM("fletcher16(\"12345678\") = 0x3FA5", buf + 0x10, exp, sizeof(exp));
+    free(buf);
+}
+
+TEST(bsd_hash_fletcher32)
+{
+    uint8_t* buf = hash_buf();
+    apply_bsd(&buf, 64, "set range:0x0,0x7\nset [h]:fletcher32\nwrite at 0x10:[h]");
+
+    uint8_t exp[4] = { 0x0A, 0x00, 0xD4, 0xD0 };
+    CHECK_MEM("fletcher32(\"12345678\") = 0x0A00D4D0", buf + 0x10, exp, sizeof(exp));
+    free(buf);
+}
+
 TEST(bsd_hash_jhash)
 {
     uint8_t* buf = hash_buf();
@@ -383,5 +638,449 @@ TEST(bsd_hash_sha1_xor64)
 
     uint8_t exp[8] = { 0x7A, 0xB2, 0xEF, 0xC5, 0xE5, 0x42, 0xC7, 0x3F };
     CHECK_MEM("sha1_xor64(\"123456789\") regression", buf + 0x10, exp, sizeof(exp));
+    free(buf);
+}
+
+/*
+ * ---- host byte order must not reach the file ---------------------------
+ *
+ * Two vectors, and what makes them vectors is that neither branches on
+ * apollo_test_be(): the expected bytes below are the answer on a PS3 and on a
+ * wasm build alike. That is the whole claim. Before these fixes each case gave
+ * one answer on a big-endian host and the reverse on a little-endian one, and
+ * nothing in the suite said so.
+ *
+ * The thing that decides it is _decode_variable_data(), which converts a
+ * variable on the way out BY LENGTH: 2, 4 and 8 bytes are treated as a
+ * host-native integer and re-emitted big-endian, every other length is copied
+ * through as a raw byte string. A producer has to know which side of that line
+ * it is on.
+ */
+
+/* carry(1) truncates the accumulator to THREE bytes, the one width with no
+ * case in that switch. _set_var_slice() is what makes it work anyway: the
+ * value is laid out big-endian and then handed to _swap_var_endianness(),
+ * which converts the widths the reader converts and leaves the rest alone. So
+ * every width below has ONE expected answer rather than a host-dependent
+ * pair. 16 bytes of 0xFF sum to 0xFF0. */
+TEST(bsd_carry_truncation_is_big_endian)
+{
+    static const uint8_t init[16] = {
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+        0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
+    };
+    static const uint8_t exp0[4] = { 0x00, 0x00, 0x0F, 0xF0 };
+    static const uint8_t exp1[3] = { 0x00, 0x0F, 0xF0 };
+    static const uint8_t exp2[2] = { 0x0F, 0xF0 };
+    static const uint8_t exp3[1] = { 0xF0 };
+    uint8_t* buf;
+
+    /* A fresh copy before every case: the write lands at offset 0, inside the
+     * range the next sum would cover, so reusing the buffer would silently
+     * change the input rather than the width under test. */
+#define CARRY_CASE(label, script, exp)                                        \
+    do {                                                                      \
+        buf = dup_bytes(init, sizeof(init));                                  \
+        CHECK_U64(label ": applied", apply_bsd(&buf, sizeof(init), script),   \
+                  sizeof(init));                                              \
+        CHECK_MEM(label, buf, exp, sizeof(exp));                              \
+        free(buf);                                                            \
+    } while (0)
+
+    CARRY_CASE("carry(0): four bytes, big-endian",
+               "set [v]:0\nset [v]:add(0x0,0xF)\nwrite at 0:[v]", exp0);
+    CARRY_CASE("carry(1): three bytes, big-endian",
+               "carry(1)\nset [v]:0\nset [v]:add(0x0,0xF)\nwrite at 0:[v]", exp1);
+    CARRY_CASE("carry(2): two bytes, big-endian",
+               "carry(2)\nset [v]:0\nset [v]:add(0x0,0xF)\nwrite at 0:[v]", exp2);
+    CARRY_CASE("carry(3): low byte",
+               "carry(3)\nset [v]:0\nset [v]:add(0x0,0xF)\nwrite at 0:[v]", exp3);
+
+    /* Accumulating in two steps must reach the same place as one. This is the
+     * half that needs _get_var_value(): the second add() seeds itself from the
+     * 3-byte variable the first one left, and reading that back as zero would
+     * silently drop the first 2040. */
+    CARRY_CASE("carry(1): 3-byte accumulator survives being re-set",
+               "carry(1)\nset [v]:0\nset [v]:add(0x0,0x7)\nset [v]:add(0x8,0xF)\nwrite at 0:[v]",
+               exp1);
+#undef CARRY_CASE
+}
+
+/*
+ * host_account_id is a byte string, handed over the same way as the PSID and
+ * the MAC addresses beside it -- but it is EIGHT bytes, which is a length the
+ * reader converts. So an id already in the order the save wants came back
+ * reversed on a little-endian build. apollo_test_host_cb serves
+ * 01 23 45 67 89 AB CD EF and that is what has to land in the file, here and
+ * on a PS3.
+ *
+ * Driven through apollo_apply_code() rather than apollo_apply_bsd_code(),
+ * because the host callback is installed by the former and there is no other
+ * way to reach it.
+ */
+extern void* apollo_test_host_cb(int info, uint32_t* size);
+
+TEST(bsd_host_account_id_is_big_endian)
+{
+    static const uint8_t want[8] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
+    static const uint8_t zero[16] = {0};
+    const char* tmpdir = getenv("TMPDIR");
+    char tmp[4096];
+    code_entry_t c;
+    uint8_t* out = NULL;
+    size_t len = 0;
+
+    if (!tmpdir || !*tmpdir) tmpdir = "/tmp";
+
+    /* A setup failure is a FAILED check, not an early return: returning
+       quietly would report this guard as passing while it tested nothing. */
+    int w = snprintf(tmp, sizeof(tmp), "%s/apollo_acct_%d.bin", tmpdir, (int) getpid());
+    if (w < 0 || (size_t) w >= sizeof(tmp) || write_buffer(tmp, zero, sizeof(zero)) != 0)
+    {
+        CHECK_U64("host_account_id: temp file setup", 0, 1);
+        return;
+    }
+
+    memset(&c, 0, sizeof(c));
+    c.type  = APOLLO_CODE_BSD;
+    c.name  = (char*) "vector";
+    c.file  = tmp;
+    c.codes = (char*) "set [id]:host_account_id\nwrite at 0:[id]";
+
+    apollo_free_var_list();
+    CHECK_U64("host_account_id: code applied",
+              apollo_apply_code(tmp, &c, apollo_test_host_cb) != 0, 1);
+
+    if (read_buffer(tmp, &out, &len) == 0)
+    {
+        CHECK_U64("host_account_id: file size unchanged", len, sizeof(zero));
+        if (len >= sizeof(want))
+            CHECK_MEM("host_account_id: written big-endian on every host",
+                      out, want, sizeof(want));
+        free(out);
+    }
+    else
+        CHECK_U64("host_account_id: result read back", 0, 1);
+    unlink(tmp);
+}
+
+/*
+ * right() and left() reach the same three-byte width from the other side:
+ * there the 3 IS the requested width, not a count of bytes dropped. Every
+ * width is pinned below with no apollo_test_be() branch, which is the claim
+ * that _set_var_slice() removed the host from the answer -- a 3-byte slice
+ * used to come out 22 33 44 on a little-endian build and 44 33 22 on a PS3.
+ */
+TEST(bsd_left_right_slices_are_big_endian)
+{
+    static const uint8_t init[16] = {0};
+    static const uint8_t right1[1] = { 0x44 };
+    static const uint8_t right2[2] = { 0x33, 0x44 };
+    static const uint8_t right3[3] = { 0x22, 0x33, 0x44 };
+    static const uint8_t right4[4] = { 0x11, 0x22, 0x33, 0x44 };
+    static const uint8_t left1[1]  = { 0x11 };
+    static const uint8_t left2[2]  = { 0x11, 0x22 };
+    static const uint8_t left3[3]  = { 0x11, 0x22, 0x33 };
+    uint8_t* buf = dup_bytes(init, sizeof(init));
+
+    CHECK_U64("right(,1) applied", apply_bsd(&buf, sizeof(init),
+              "set [v]:right(0x11223344,1)\nwrite at 0:[v]"), sizeof(init));
+    CHECK_MEM("right(,1): lowest byte", buf, right1, sizeof(right1));
+
+    CHECK_U64("right(,2) applied", apply_bsd(&buf, sizeof(init),
+              "set [v]:right(0x11223344,2)\nwrite at 0:[v]"), sizeof(init));
+    CHECK_MEM("right(,2): low half, big-endian", buf, right2, sizeof(right2));
+
+    CHECK_U64("right(,3) applied", apply_bsd(&buf, sizeof(init),
+              "set [v]:right(0x11223344,3)\nwrite at 0:[v]"), sizeof(init));
+    CHECK_MEM("right(,3): low three bytes, big-endian", buf, right3, sizeof(right3));
+
+    CHECK_U64("right(,4) applied", apply_bsd(&buf, sizeof(init),
+              "set [v]:right(0x11223344,4)\nwrite at 0:[v]"), sizeof(init));
+    CHECK_MEM("right(,4): whole value, big-endian", buf, right4, sizeof(right4));
+
+    CHECK_U64("left(,1) applied", apply_bsd(&buf, sizeof(init),
+              "set [v]:left(0x11223344,1)\nwrite at 0:[v]"), sizeof(init));
+    CHECK_MEM("left(,1): highest byte", buf, left1, sizeof(left1));
+
+    CHECK_U64("left(,2) applied", apply_bsd(&buf, sizeof(init),
+              "set [v]:left(0x11223344,2)\nwrite at 0:[v]"), sizeof(init));
+    CHECK_MEM("left(,2): high half, big-endian", buf, left2, sizeof(left2));
+
+    CHECK_U64("left(,3) applied", apply_bsd(&buf, sizeof(init),
+              "set [v]:left(0x11223344,3)\nwrite at 0:[v]"), sizeof(init));
+    CHECK_MEM("left(,3): high three bytes, big-endian", buf, left3, sizeof(left3));
+    free(buf);
+}
+
+/*
+ * The shape apollo-patches actually ships, and the one every carry vector
+ * above misses: PSP/ULUS10579 (BlazBlue: Continuum Shift II) sums a whole
+ * SYSTEM.DAT with wadd() under carry(2).
+ *
+ *   set [csum]:0
+ *   carry(2)
+ *   set pointer:eof+1
+ *   set [csum]:wadd(0x000004,pointer)
+ *   set [csum]:xor:FFFF
+ *   write at 0x000000:[csum]
+ *
+ * The other vectors sum four or sixteen bytes, so their accumulator never
+ * passes 0xFFFF and the fold loop
+ *
+ *   while (carry > 0 && add > 0xFFFF)
+ *       add = (add & 0xFFFF) + ((add & 0xFFFF0000) >> 8*carry);
+ *
+ * never executes once. A real save runs it, and these two sizes run it once
+ * and twice respectively. They discriminate: skip the fold and 0x2000 would
+ * write the raw low half 0x0BDE ^ FFFF = F421 instead of E3E5 ^ FFFF = 1C1A.
+ *
+ * Expected values computed from the algorithm by hand, not captured from this
+ * engine. Both sums stay under 2^32, so the uint32_t accumulator does not wrap
+ * and the arithmetic is unambiguous.
+ *
+ * xor:FFFF also pins the storage contract from the other side: _bitwise_var_value
+ * refuses a length mismatch, so the variable has to be exactly the two bytes
+ * carry(2) leaves, held host-native the way that helper expects to find it.
+ */
+static void carry_fold_case(size_t n, uint8_t hi, uint8_t lo, const char* label)
+{
+    uint8_t* init = malloc(n);
+    uint8_t* buf;
+    uint8_t exp[2];
+
+    for (size_t i = 0; i < n; i++)
+        init[i] = (uint8_t) (i * 7 + 3);
+
+    buf = dup_bytes(init, n);
+    exp[0] = hi; exp[1] = lo;
+
+    check_u64(__FILE__, __LINE__, label,
+              apply_bsd(&buf, n,
+                        "set [csum]:0\n"
+                        "carry(2)\n"
+                        "set pointer:eof+1\n"
+                        "set [csum]:wadd(0x000004,pointer)\n"
+                        "set [csum]:xor:FFFF\n"
+                        "write at 0x000000:[csum]"), n);
+    check_mem(__FILE__, __LINE__, label, buf, exp, sizeof(exp));
+    /* everything past the checksum is untouched */
+    check_mem(__FILE__, __LINE__, label, buf + 2, init + 2, n - 2);
+
+    free(buf);
+    free(init);
+}
+
+TEST(bsd_carry_fold_over_long_buffer)
+{
+    carry_fold_case(0x2000,  0x1C, 0x1A, "ULUS10579 shape, 8KB: wadd carry(2), fold runs once");
+    carry_fold_case(0x20000, 0x93, 0xA2, "ULUS10579 shape, 128KB: wadd carry(2), fold runs twice");
+}
+
+/*
+ * xor/and/or with an ASYMMETRIC mask at every kind of width. The mask arrives
+ * in file order and has to be laid out the way the variable is held:
+ * host-native at 2, 4 and 8 bytes, file order at any other width -- here
+ * right() and left() slices and a read() at 1 or 3 bytes. (Wider variables
+ * cannot be masked at all yet: re-setting a variable keeps only a 32-bit
+ * value.) A mask such as
+ * xor:010203 is what tells the two apart; a symmetric one (FFFF) cannot, which
+ * is how a little-endian build came to reverse the mask at EVERY width and
+ * apply it back to front against a 3-byte variable.
+ */
+TEST(bsd_bitwise_mask_byte_order)
+{
+    static const struct {
+        const char* script;
+        uint8_t exp[4];
+        size_t len;
+    } cases[] = {
+        /* integer widths: stored host-native */
+        { "set [v]:read(0,2)\nset [v]:xor:0102\nwrite at 8:[v]",
+          {0xAB, 0xB9}, 2 },
+        { "set [v]:read(0,4)\nset [v]:and:F0F00F0F\nwrite at 8:[v]",
+          {0xA0, 0xB0, 0x0C, 0x0D}, 4 },
+        /* every other width: stored in file order */
+        { "set [v]:read(0,3)\nset [v]:xor:010203\nwrite at 8:[v]",
+          {0xAB, 0xB9, 0xCF}, 3 },
+        { "set [v]:right(0x12345678,3)\nset [v]:xor:010203\nwrite at 8:[v]",
+          {0x35, 0x54, 0x7B}, 3 },
+        { "set [v]:left(0x12345678,3)\nset [v]:and:F00F0F\nwrite at 8:[v]",
+          {0x10, 0x04, 0x06}, 3 },
+        { "set [v]:right(0x12345678,1)\nset [v]:or:01\nwrite at 8:[v]",
+          {0x79}, 1 },
+    };
+    const uint8_t init[16] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
+    {
+        uint8_t* buf = dup_bytes(init, sizeof(init));
+        size_t n = apply_bsd(&buf, sizeof(init), cases[i].script);
+
+        CHECK_U64("bitwise mask: applied", n, sizeof(init));
+        CHECK_MEM("bitwise mask: bytes in file order", buf + 8, cases[i].exp, cases[i].len);
+        free(buf);
+    }
+}
+
+/*
+ * Seed-then-accumulate, the other real shape: PS3/BLUS30863 (Champion Jockey)
+ * primes the variable with a constant and then adds a range into it.
+ *
+ *   set [csum]:0x190518
+ *   set [csum]:add(0x000010,0x190527)
+ *   write at 0xC:[csum]
+ *
+ * The second `set` overwrites a variable that already exists, which is the
+ * path _get_var_value() reads and _set_var_slice() writes back -- the one
+ * place the slice rewrite could have dropped a value silently rather than
+ * reversing it. add() seeds its accumulator from what comes out, so a
+ * mis-read seed is invisible except as a wrong checksum.
+ *
+ * Both of the patch's branches, with its own constants: the 42KB SYSTEM range
+ * and the 1.6MB STORY one. No carry() here, so the variable stays four bytes
+ * wide and the write emits it big-endian. Expected values computed from the
+ * algorithm; neither sum wraps the uint32_t accumulator.
+ */
+static void seed_then_add_case(uint32_t seed, uint32_t start, uint32_t end,
+                               const uint8_t exp[4], const char* label)
+{
+    size_t n = (size_t) end + 1;
+    uint8_t* init = malloc(n);
+    uint8_t* buf;
+    char script[160];
+
+    for (size_t i = 0; i < n; i++)
+        init[i] = (uint8_t) (i * 7 + 3);
+
+    buf = dup_bytes(init, n);
+    snprintf(script, sizeof(script),
+             "set [csum]:0x%06X\nset [csum]:add(0x%06X,0x%06X)\nwrite at 0xC:[csum]",
+             seed, start, end);
+
+    check_u64(__FILE__, __LINE__, label, apply_bsd(&buf, n, script), n);
+    check_mem(__FILE__, __LINE__, label, buf + 0xC, exp, 4);
+    /* the write lands before the summed range, so the input is untouched */
+    check_mem(__FILE__, __LINE__, label, buf + 0x10, init + 0x10, n - 0x10);
+
+    free(buf);
+    free(init);
+}
+
+TEST(bsd_seed_then_add_existing_variable)
+{
+    static const uint8_t sys_exp[4]   = { 0x00, 0x53, 0x67, 0x74 };
+    static const uint8_t story_exp[4] = { 0x0C, 0x8F, 0x11, 0xEC };
+
+    seed_then_add_case(0xA628, 0x10, 0xA637, sys_exp,
+                       "BLUS30863 SYSTEM: seed 0xA628 + add(0x10,0xA637)");
+    seed_then_add_case(0x190518, 0x10, 0x190527, story_exp,
+                       "BLUS30863 STORY: seed 0x190518 + add(0x10,0x190527)");
+}
+
+/*
+ * A pointer argument the parser cannot read is 0, not whatever the stack held.
+ *
+ * sscanf() leaves its target alone when it converts nothing, so reading that
+ * target back unconditionally handed the code an uninitialised value. The live
+ * case was "set pointer:read(0x20)" -- the one-argument spelling of read(),
+ * which matches no branch and falls through to the plain-number one -- and it
+ * made four PS3 patches in the database hash differently from one run to the
+ * next. Sanitisers do not catch it (ASAN does not track uninitialised stack,
+ * and MSan does not build here), so the value is pinned instead.
+ */
+TEST(bsd_unreadable_pointer_arg_is_zero)
+{
+    uint8_t init[16] = {0};
+    uint8_t* buf = dup_bytes(init, sizeof(init));
+
+    size_t n = apply_bsd(&buf, sizeof(init), "set pointer:read(0x20)\nwrite next 0:EEFF");
+
+    uint8_t exp[16] = {0};
+    exp[0] = 0xEE; exp[1] = 0xFF;
+    CHECK_U64("unreadable pointer: size unchanged", n, sizeof(init));
+    CHECK_MEM("set pointer:read(0x20) -> 0", buf, exp, sizeof(exp));
+
+    /* and the same for an argument that is not a number at all */
+    memset(buf, 0, sizeof(init));
+    apply_bsd(&buf, sizeof(init), "set pointer:nothexatall\nwrite next 0:EEFF");
+    CHECK_MEM("set pointer:nothexatall -> 0", buf, exp, sizeof(exp));
+
+    free(buf);
+}
+
+/* The two-argument spelling still resolves: read() is always 4 bytes, read
+   big-endian, so 00 00 00 0C at offset 8 puts the pointer at 12. */
+TEST(bsd_pointer_read_two_args)
+{
+    uint8_t init[16] = {0};
+    init[11] = 0x0C;
+    uint8_t* buf = dup_bytes(init, sizeof(init));
+
+    size_t n = apply_bsd(&buf, sizeof(init), "set pointer:read(0x8,4)\nwrite next 0:EEFF");
+
+    uint8_t exp[16] = {0};
+    exp[11] = 0x0C;
+    exp[12] = 0xEE; exp[13] = 0xFF;
+    CHECK_U64("read(0x8,4): size unchanged", n, sizeof(init));
+    CHECK_MEM("set pointer:read(0x8,4) -> 12", buf, exp, sizeof(exp));
+    free(buf);
+}
+
+/* An absent offset is a legitimate zero: "set pointer:eof" is the last byte.
+   One patch in the database writes it that way. */
+TEST(bsd_pointer_eof_without_offset)
+{
+    uint8_t init[16] = {0};
+    uint8_t* buf = dup_bytes(init, sizeof(init));
+
+    size_t n = apply_bsd(&buf, sizeof(init), "set pointer:eof\nwrite next 0:EE");
+
+    uint8_t exp[16] = {0};
+    exp[15] = 0xEE;
+    CHECK_U64("eof without offset: size unchanged", n, sizeof(init));
+    CHECK_MEM("set pointer:eof -> last byte", buf, exp, sizeof(exp));
+    free(buf);
+}
+
+/*
+ * sw4_checksum's four words reach the save big-endian.
+ *
+ * The hash is stored as a 16-byte blob, and the variable reader converts only
+ * the INT16/32/64 widths -- a blob passes through untouched. So the words are
+ * byte-swapped where they are produced; without that, mid() slices them
+ * backwards on a little-endian host and the patch writes a reversed checksum.
+ * On the PS3 itself the conversion is a no-op, which is why it went unnoticed.
+ *
+ * This pins the byte ORDER, not the algorithm: the expected words come from
+ * apollo_hash_sw4() itself. Until now the only thing guarding it was a corpus
+ * golden that was never regenerated after the fix, so the drift went unseen.
+ */
+TEST(bsd_hash_sw4_words_are_big_endian)
+{
+    /* apollo_hash_sw4() reads fixed offsets up to ~362KB and returns zeros for
+       anything smaller, so this vector cannot be a short one. */
+    enum { N = 384 * 1024 };
+    static uint8_t init[N];
+    for (size_t i = 0; i < N; i++) init[i] = (uint8_t)(i * 11 + 5);
+
+    uint32_t word[4] = {0};
+    apollo_hash_sw4(init, N, word);
+
+    uint8_t* buf = dup_bytes(init, N);
+    apply_bsd(&buf, N, "set range:0x0,0x5FFFF\n"
+                       "set [h]:sw4_checksum\n"
+                       "set [c1]:mid([h],0x00,4)\n"
+                       "set [c4]:mid([h],0x0C,4)\n"
+                       "write at 0x0:[c1]\n"
+                       "write at 0x4:[c4]\n");
+
+    uint8_t exp[8];
+    for (int i = 0; i < 4; i++) exp[i]     = (uint8_t)(word[0] >> (24 - 8 * i));
+    for (int i = 0; i < 4; i++) exp[4 + i] = (uint8_t)(word[3] >> (24 - 8 * i));
+
+    CHECK_U64("sw4 over this buffer is not all zeros", word[0] != 0, 1);
+    CHECK_MEM("mid([sw4],0,4) and mid([sw4],0xC,4) write words 0 and 3 big-endian",
+              buf, exp, sizeof(exp));
     free(buf);
 }

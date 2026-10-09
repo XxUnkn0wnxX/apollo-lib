@@ -1,16 +1,23 @@
 # Apollo test suite
 
-Characterization tests that **freeze the current behavior of the patch engine**
-so the upcoming *"remove the compile-time big-endian flag"* refactor can be
-proven byte-for-byte behavior-preserving.
+Characterization tests that **freeze the behavior of the patch engine**, so a
+change to it has to be a deliberate one rather than a surprise.
 
-Today endianness is a **compile-time** choice: the `BIGENDIAN` make flag defines
-`__PS3_PC__`, which makes the `MEM*`/`PADDING` macros byte-swap
-(`include/types.h`). This suite builds **twice** from the same sources —
-`test_apollo_le` (default little-endian) and `test_apollo_be`
-(`-D__PS3_PC__`) — exactly as `tools/Makefile` does, and captures both
-behaviors as the reference. After endianness becomes a **runtime** choice, the
-same vectors and golden manifests must still reproduce identically.
+Endianness is a **runtime** choice: `apollo_apply_sw_code()` takes the save-data
+byte order from the code entry's `APOLLO_CODE_FLAG_ORDER_*` flags, falling back
+to `apollo_set_endianness()` (`source/patches.c`). Nothing in the library
+branches on it at compile time.
+
+So there is **one binary**, `test_apollo`, and it runs the whole vector suite
+twice in a single process — a little-endian pass, then a big-endian one —
+printing a header and totals for each. Vectors whose expected bytes depend on
+the mode branch on `apollo_test_be()`; vectors that are mode-invariant write
+their expected bytes once, which asserts that invariance.
+
+> These vectors and the golden manifests were originally captured from the two
+> binaries this suite used to build (`test_apollo_le` and `test_apollo_be`,
+> the latter compiled with `-D__PS3_PC__`) to prove the compile-time-to-runtime
+> refactor byte-for-byte behavior-preserving. They still reproduce identically.
 
 ## Layout
 
@@ -18,22 +25,158 @@ same vectors and golden manifests must still reproduce identically.
 |------|---------|
 | `test_savewizard.c` | Hand-authored Save Wizard opcode vectors, expected bytes computed by hand from `docs/savewizard.rst`, with per-endian expectations where the `MEM*` flag matters. |
 | `test_sw_endian_gaps.c` | The endian-critical Save Wizard opcodes: type 3 (8-byte `MEM64` add + pointer-relative form), type 4 (32-bit `MEM32` multi-write), type 6 (pointer "mega code" — `MEM16` read and `MEM32` write), type 7 (conditional no-less/no-more-than, `MEM16`/`MEM32`), type 9 (pointer add/sub, end-pointer set), and type D's explicit 16-bit BE vs LE reads. |
-| `test_bsd.c` | BSD script vectors: verbatim write/insert/delete/repeat, `left`/`mid`/`right`, `carry`-based truncation (the `HOST_LSB`/`HOST_MSB` fixes), `read()` at int16/int32/int64 widths, and hash smoke tests (`crc32big`, `sha1` against known vectors; `jhash` characterised). |
+| `test_bsd.c` | BSD script vectors: verbatim write/insert/delete/repeat, `left`/`mid`/`right`, `carry`-based truncation (the host-order fixes, and the big-endian slice fix that superseded them), `read()` at int16/int32/int64 widths, and hash smoke tests (`crc32big`, `sha1` against known vectors; `jhash` characterised). Fletcher-16/32 get full known-answer coverage: the published check values, the deferred-modulo block boundary (against exact arbitrary-precision reference values, not a second copy of the blocked algorithm), odd-length zero padding, an empty range, and both BSD commands. Fletcher-32's little-endian word order is fixed in the algorithm rather than taken from the host, so every one of those vectors holds identically in the LE and BE builds. |
 | `test_search.c` | Search / conditional-skip behavior: Save Wizard types 8 (forward), B (backward), C (address-byte), D (byte-test skip), and the BSD `search` command — each covering found / not-found / occurrence-count paths. |
-| `test_parse.c` | Savepatch parsing (`load_patch_code_list`): code count, name extraction, Save-Wizard-vs-BSD type detection, file association, `DEFAULT`/`INFO`/`PYTHON`/`GROUP` flags, `(REQUIRED)`, `EMPTY`, and comment stripping. |
+| `test_parse.c` | Savepatch parsing (`apollo_load_code_list`): code count, name extraction, Save-Wizard-vs-BSD type detection, file association, `DEFAULT`/`INFO`/`PYTHON`/`GROUP` flags, `(REQUIRED)`, `EMPTY`, and comment stripping. |
+| `test_samples.c` | **Opt-in** known-answer vectors against real game saves from the `save-decrypters` repo — every tool there that ships an `.enc`/`.dec` pair. Algorithms with a non-trivial range are driven by the **actual script from the shipped `.savepatch`**, so engine/patch coupling is covered — including `search`-derived ranges, `{TAG}` option branches, and the multi-code chains a front-end applies in file order. Covers BSD ciphers, the MGS5 PS3/PS4 key set, and the **Python** patches (the only coverage MicroPython has here — `test_corpus.c` skips every Python code). Run with `make check-samples SAMPLES=... PATCHES=...`. |
+| `test_mgspw.c` | MGS Peace Walker bounds vectors using synthetic buffers: undersized buffer refused, minimum size accepted, out-of-range data-derived salt offset refused, and the PSP size guard held independent of the (larger) PS3 one — a shared guard rejects every real PSP save. Correctness against real saves of all three types is in `test_samples.c`. |
+| `test_crypt_bsd.c` | BSD `encrypt`/`decrypt` command vectors: encrypt-then-decrypt round-trips for every cipher with an inverse (AES ECB/CBC, Camellia, 3-DES ECB/CBC, Blowfish ECB/CBC, Diablo 3, Silent Hill 3, NFS Undercover, MGS, FFXIII, Borderlands 3, Monster Hunter), twice-applied checks for the self-inverse streams (AES CTR, RGG Studio, DW8XL, MGS5 TPP), case-insensitive keyword matching, and unknown-algorithm inertness. |
+| `test_offzip.c` | offZip session vectors: planted-stream discovery (offset / zip / unzip lengths), `offzip_util` geometry plus inflated payload, `offzip_free(NULL)` safety, sub-`g_minzip` blocks ignored, and — the point of the handle — two concurrent sessions advancing independently. |
 | `test_corpus.c` | Golden regression: applies every code from a tree of real `.savepatch` files to a fixed synthetic buffer and emits a stable manifest line per code. |
-| `test_common.[ch]` | Tiny assertion framework, deterministic data helpers, host-callback + log stubs, code builders. |
+| `test_common.[ch]` | Tiny assertion framework, deterministic data helpers, host-callback + log stubs, code builders, and the runtime endian mode (`apollo_test_be()`). |
 | `fixtures/` | A curated, vendored set of `.savepatch` files so the committed goldens are reproducible from this repo alone. |
-| `golden/` | Committed reference manifests `corpus_le.txt` / `corpus_be.txt`. |
+| `golden/` | Committed reference manifests `corpus_le.txt` / `corpus_be.txt` (the two corpus modes). |
 
 ## Running
 
 ```bash
 cd tests
-make check           # hand-authored opcode vectors, LE + BE (fast, no external deps)
+make check           # hand-authored opcode vectors, LE + BE passes (fast, no external deps)
 make check-corpus    # re-apply fixtures and diff against committed goldens
-make bsd-invariance  # assert BSD output is identical in the LE and BE builds
+make bsd-invariance  # assert BSD output is identical in the LE and BE passes
 ```
+
+Broader correctness needs real game saves, which are likewise not vendored.
+Point the check at a clone of
+[save-decrypters](https://github.com/bucanero/save-decrypters):
+
+```bash
+make check-samples SAMPLES=/path/to/save-decrypters \
+                   PATCHES=/path/to/apollo-patches
+```
+
+A round-trip only proves a cipher is reversible; these prove libapollo speaks
+the real format. The NFS Undercover off-by-one fixed in `63f334a` round-tripped
+perfectly and still produced the wrong bytes.
+
+`PATCHES` is only needed for the Python vectors, whose patches `import` helper
+modules from `apollo-patches/python`. Left at its `fixtures` default those skip
+with a message and everything else still runs.
+
+To run every opt-in vector at once, the way CI does, use `check-full`:
+
+```bash
+make check-full SAMPLES=/path/to/save-decrypters \
+                PATCHES=/path/to/apollo-patches
+```
+
+It is `check-samples` made strict: a vector that skips fails the target, and the full output is kept in
+`build/check-full.log`. The `samples` job in `.github/workflows/tests.yml`
+checks out both repos at their default branch and runs it on every push, so a
+sample renamed or removed upstream shows up as a red job instead of quietly
+lost coverage. Run it against clean clones: a local checkout can pass on files
+that only exist in your working tree.
+
+### On a big-endian host
+
+The "BE pass" above only flags the codes big-endian; on an x86 or ARM machine
+the host is still little-endian, so every path that depends on the host's own
+byte order (`BE16`/`BE32`/`BE64`, `_swap_var_endianness()`, how variables are
+stored) does nothing and is never really tested. The `big-endian` job in
+`.github/workflows/tests.yml` runs the suite on a real big-endian host instead:
+cross-built for 64-bit PowerPC, the PS3's CPU family, and run under qemu-user.
+To do the same on Ubuntu, with `gcc-powerpc64-linux-gnu`,
+`libc6-dev-ppc64-cross` and `qemu-user` installed and zlib and mbedTLS
+cross-built (see the job for the exact steps):
+
+```bash
+make ci check-corpus CC=powerpc64-linux-gnu-gcc RUN=qemu-ppc64 \
+     EXTRA_CFLAGS=-I$ZLIB/include LIBZ="-L$ZLIB/lib -lz" EXTRA_LDFLAGS=-static
+```
+
+`check-corpus` belongs here even though it is not part of `ci`: the goldens
+come from a little-endian machine, so matching them byte for byte is the proof
+that the engine's output does not depend on the host.
+
+Both passes name their byte order on every code they build. An unflagged code
+falls back to the host's order (that is what lets it write a PS3 save
+big-endian on a PS3), so leaving the LE pass unflagged turned it into a second
+BE pass on a big-endian host. `sw_unflagged_code_follows_host` pins that
+fallback separately.
+
+Three things these vectors pin down that are easy to get wrong from the outside:
+
+- **Byte order is the host's job on the BSD path.** `apollo_apply_bsd_code()`
+  ignores the per-code `APOLLO_CODE_FLAG_ORDER_*` flags — only
+  `apollo_apply_sw_code()` reads those — and `apollo_apply_code()` does not set
+  it either. It comes from `apollo_set_endianness()` alone, and
+  `apollo_free_var_list()` resets it, so a host has to re-assert it **before
+  every apply** (which is what `apctl_apply()` in `apollo-patcher` does). The
+  MGS5 PS3 vectors fail if either half of that is missing.
+- **Chained Python codes are not the same as concatenated ones.** Each code
+  gets `savedata` as a fresh bytearray built from the file; a code that
+  reassigns it (`savedata = uzlib.compress(...)`) leaves immutable `bytes`
+  behind, which is fine at a code boundary and a `TypeError` mid-body. The FF
+  Pixel Remaster vector applies its four codes separately for that reason.
+- **Compression is not canonical.** Re-compressing Max Payne 3's plaintext
+  yields 17202 bytes where the sample's own compressor produced 18108, and
+  both decompress to the same save — so those vectors assert
+  `decrypt(encrypt(x)) == x` rather than comparing against the stored
+  ciphertext, and skip the header fields computed over the compressed stream.
+
+**The Python vectors are why the wasm build works at all.** They were the first
+thing in this suite to execute MicroPython — `test_corpus.c` skips every Python
+code — and they turned up two real defects:
+
+- **`micropy_mpz_as_bytes()` did not zero-fill.** It emitted one byte per digit
+  the bignum had and returned, so `struct.pack_into('>I', buf, 0, x)` wrote
+  only the low two bytes of a four-byte field when `x` needed fewer, and the
+  high two kept whatever the buffer held. `MP_SMALL_INT` is 31 bits on a 32-bit
+  target and 63 on a 64-bit one, so the values in question are bignums on
+  wasm32, **PS3, PSP and PS Vita** and plain small ints on x86_64 — this was a
+  32-bit bug on every console build, not a wasm one, and the native suite could
+  never have caught it. It corrupted ~80% of a Dead or Alive 5 save.
+  `python_mpz_pack_into_zero_fills` pins it, and needs no fixtures, so it runs
+  in a plain `make check` (where, being 64-bit, it will pass either way — it
+  earns its keep on the wasm and console builds).
+
+- **The conservative GC is blind under wasm.** `micropy_gc_collect()` scans from
+  `&regs` up to `vm.stack_top`, but wasm keeps locals in wasm locals rather
+  than addressable memory: a measured run had **1276 bytes** of shadow stack for
+  the entire live VM call chain. Live objects went unseen, were swept, and the
+  next free of one tripped `assert(!"bad free")` on an `AT_FREE` block. The fix
+  is Binaryen's `--spill-pointers`, which `Makefile.wasm` now applies as a
+  post-link step — see the note at the top of that file for why passing it via
+  `-sBINARYEN_EXTRA_PASSES` silently does nothing.
+
+One vector still fails under wasm: `sample_mhworld`, the 8MB save, raises
+`MemoryError`. Spilling makes the scan retain aggressively, and it exhausts the
+MicroPython heap at `PY_HEAP_SIZE` and at 4x it. It is a clean failure, not
+corruption, and the other fourteen Python vectors pass.
+
+Two known divergences the vectors deliberately do **not** paper over:Two known divergences the vectors deliberately do **not** paper over:
+
+- **Monster Hunter World** — `python/mhworld.py` and
+  `monsterhunter-world-decrypter` disagree about where 3128 bytes sit in the
+  decrypted file (the C tool rotates the `0x600488` window, the patch splices
+  the block out and leaves it in place). Both round-trip, and their ciphertext
+  agrees, but their plaintexts differ by ~2.4KB. The vector asserts the
+  round-trip only; a save editor written against one layout will misread the
+  other, so the two want reconciling upstream.
+- **NFS Rivals** — the shipped `USR-DATA` pair is not self-consistent: it is
+  716800 bytes but only the first 358404 were ever encrypted, so neither the
+  savepatch nor the C tool (which agree with each other) can reproduce the
+  `.enc` from the `.dec`. The vector pins the range the fixture actually
+  covers and still proves the cipher and the custom-CRC parameters.
+
+`check-samples` covers all three MGS PW save types from the `save-decrypters`
+samples. Note libapollo leaves the decrypted header byte-swapped for PSP saves
+too, where the reference tool swaps the first 17 words back — one convention for
+both platforms, so a savepatch reads the header fields the same way on PS3 and
+PSP, and PS3 output stays identical to previous releases. The PSP vectors
+therefore compare the payload past `0x44` against the reference, assert the
+header is exactly the word-swapped reference header, and prove the round-trip by
+re-encrypting libapollo's *own* plaintext back to the original file.
 
 `make golden` regenerates the committed manifests — only run it deliberately
 (pre-refactor, or when fixtures change), then commit the result.
@@ -44,7 +187,8 @@ state):
 
 ```bash
 make check-corpus PATCHES=/path/to/apollo-patches   # diff vs committed goldens (fixtures only)
-./test_apollo_le --corpus /path/to/apollo-patches > /tmp/le.txt   # ad-hoc manifest
+./test_apollo --corpus /path/to/apollo-patches > /tmp/le.txt        # ad-hoc manifest
+./test_apollo --corpus /path/to/apollo-patches --be > /tmp/be.txt   # ...big-endian
 ```
 
 ## Coverage matrix (hand vectors)
@@ -72,14 +216,14 @@ make check-corpus PATCHES=/path/to/apollo-patches   # diff vs committed goldens 
 
 | Command / function | Coverage | Tests |
 |--------------------|----------|-------|
-| `carry(n)` | drives wadd/add truncation | `bsd_carry_padding_truncation`, `bsd_add_carry_truncation` |
+| `carry(n)` | drives wadd/add truncation, every width | `bsd_carry_padding_truncation`, `bsd_add_carry_truncation`, `bsd_carry_truncation_is_big_endian` |
 | `set pointer:` | absolute address | `bsd_write_next_pointer` |
 | `set range:` | range for hashes | `bsd_hash_*` |
 | `set [v]:read(o,n)` | int16 / int32 / int64 widths | `bsd_read_int16`, `bsd_read_int32`, `bsd_read_int64` |
-| `set [v]:wadd` | carry truncation (HOST_LSB) | `bsd_carry_padding_truncation` |
-| `set [v]:add` | carry truncation (HOST_LSB) | `bsd_add_carry_truncation` |
-| `set [v]:right` | rightmost bytes (HOST_LSB) | `bsd_right_truncation` |
-| `set [v]:left` | leftmost bytes (HOST_MSB) | `bsd_left` |
+| `set [v]:wadd` | carry truncation | `bsd_carry_padding_truncation` |
+| `set [v]:add` | carry truncation | `bsd_add_carry_truncation` |
+| `set [v]:right` | rightmost bytes, widths 1-4 | `bsd_right_truncation`, `bsd_left_right_slices_are_big_endian` |
+| `set [v]:left` | leftmost bytes, widths 1-3 | `bsd_left`, `bsd_left_right_slices_are_big_endian` |
 | `set [v]:mid` | byte substring | `bsd_mid`, `bsd_mid_offset` |
 | `set [v]:endian_swap` | byte reversal (existing var) | `bsd_update_existing_variable` |
 | `set [v]:crc32big` | CRC-32/BZIP2 (known vector) | `bsd_hash_crc32big` |
@@ -87,7 +231,7 @@ make check-corpus PATCHES=/path/to/apollo-patches   # diff vs committed goldens 
 | `set [v]:jhash` | Jenkins hash (characterised) | `bsd_hash_jhash` |
 | `set [v]:md5_xor` | folded MD5 (characterised) | `bsd_hash_md5_xor` |
 | `set [v]:sha1_xor64` | folded SHA-1 (characterised) | `bsd_hash_sha1_xor64` |
-| existing-variable update | re-fetch value (HOST_LSB @796) | `bsd_update_existing_variable` |
+| existing-variable update | re-fetch value | `bsd_update_existing_variable` |
 | `write at` | verbatim hex | `bsd_write_hex` |
 | `write next` | pointer-relative | `bsd_write_next_pointer` |
 | `write …:repeat(c,v)` | repeated value | `bsd_write_repeat` |
@@ -123,7 +267,7 @@ Robustness notes:
   wild pointer on synthetic data yields one stable `CRASH(sig=N)` line instead
   of derailing the run. Crashes are deterministic and comparable across the
   refactor.
-- Codes run through the public `apply_cheat_patch_code()` entry point via a temp
+- Codes run through the public `apollo_apply_code()` entry point via a temp
   file, exercising the real host callback and file path.
 - Python codes and offzip-extracted targets are skipped (interpreter / external
   state, out of scope for endian testing).
@@ -151,18 +295,18 @@ memcpy(var->data, (uint8_t*)&add + PADDING(carry), var->len);   // PADDING: carr
 ```
 
 `PADDING` follows the *target save-data* byte order, but `&add` is a **host**
-integer. On the `__PS3_PC__` build (big-endian save data simulated on a
-little-endian PC) this kept the **high** half of the accumulator instead of the
-low half — e.g. `wadd = 0x000068AC` was written as `00 00` instead of `68 AC`.
-Both a real PS3 (`__PPU__`) and a real PS4/PC write `68 AC`, so `__PS3_PC__` was
-simply wrong.
+integer. With big-endian save data on a little-endian PC (then the
+`-D__PS3_PC__` build, now the BE pass) this kept the **high** half of the
+accumulator instead of the low half — e.g. `wadd = 0x000068AC` was written as
+`00 00` instead of `68 AC`. Both a real PS3 (`__PPU__`) and a real PS4/PC write
+`68 AC`, so that path was simply wrong.
 
-The fix introduces `HOST_LSB()` (in `include/types.h`), which follows the **real
-host** byte order — `carry` only on a genuinely big-endian host (`__PPU__`), `0`
-everywhere else including `__PS3_PC__` — and switches the four BSD host-integer
-truncation sites to it. The save-wizard path keeps `PADDING` (it slices a value
+The fix introduced `HOST_LSB()` (then in `include/types.h`), which follows the
+**real host** byte order — `carry` only on a genuinely big-endian host
+(`__PPU__`), `0` everywhere else, whatever the save-data order — and switched
+the four BSD host-integer truncation sites to it. The save-wizard path keeps `PADDING` (it slices a value
 already arranged in target-endian order). Result: BSD output is now identical in
-the LE and BE builds (`make bsd-invariance`), the LE golden manifest is
+the LE and BE passes (`make bsd-invariance`), the LE golden manifest is
 unchanged, and only the one affected BE line moved to match LE.
 
 All four fixed sites have dedicated regression guards (each verified to fail
@@ -176,9 +320,9 @@ The same class of bug affected the two other byte-extraction helpers:
 
 - `left(value,len)` copied from offset 0 with no host adjustment, so on a
   little-endian host it returned the *low* bytes (identical to `right`) instead
-  of the leftmost/most-significant bytes. It now uses a new `HOST_MSB()` macro
-  (the complement of `HOST_LSB`), so `left(0x00012345,2)` yields `00 01` on every
-  build.
+  of the leftmost/most-significant bytes. It was given a `HOST_MSB()` macro (the
+  complement of `HOST_LSB`) so that `left(0x00012345,2)` yields `00 01` on every
+  build — see the superseding fix below, which took over both macros' job.
 - `mid(value,start,len)` extracts a slice of the value's big-endian byte view,
   but for 2/4/8-byte slices the write path byte-swapped it on little-endian
   builds. It now normalises the slice to host order (like `read()`), so the
@@ -192,6 +336,37 @@ Guards: `bsd_left`, `bsd_mid`, `bsd_mid_offset`.
 
 **Refactor implication:** BSD and Save Wizard answer to *different* notions of
 endianness — Save Wizard `MEM*`/`PADDING` follow the target save-data order,
-while BSD arithmetic truncation follows the host order via `HOST_LSB`. When
-endianness becomes a runtime choice, keep these two concerns distinct; only the
-save-data-order one should move under the runtime switch.
+while BSD arithmetic truncation follows the host order. When endianness becomes
+a runtime choice, keep these two concerns distinct; only the save-data-order one
+should move under the runtime switch.
+
+### Superseded: `_set_var_slice()` replaces `HOST_LSB` / `HOST_MSB`
+
+Keying the slice on the host was necessary but not sufficient, and the two
+macros are gone — `include/types.h` no longer defines them.
+
+They pick the correct **bytes** on either host but leave them in host **order**.
+That is only recoverable at the widths `_decode_variable_data()` converts: it
+works by LENGTH, so 2, 4 and 8 bytes are taken for a host-native integer and
+re-emitted big-endian, while every other length is copied through as a raw byte
+string. A 3-byte slice therefore reached the file as `22 33 44` on a
+little-endian build and `44 33 22` on a PS3 — unreachable from `carry(1)`,
+`right(v,3)` and `left(v,3)` alike, and invisible to a suite that only ever ran
+on one host.
+
+`_set_var_slice()` lays the value out big-endian first — the order the bytes
+must reach the file in — and then calls `_swap_var_endianness()`, which is a
+no-op for exactly the widths needing no conversion. One call covers both cases
+without a branch, and `msb` is all that separates `left()` from `right()`. All
+four truncation sites now go through it.
+
+Its inverse, `_get_var_value()`, had to learn the same two cases: the
+existing-variable re-fetch seeds `add()`/`wadd()`'s accumulator, and reading a
+3-byte variable back as zero would have silently dropped everything counted so
+far.
+
+Guards, each verified to fail with the fix backed out:
+`bsd_carry_truncation_is_big_endian` (widths 0-3 plus a two-step accumulate)
+and `bsd_left_right_slices_are_big_endian` (`right` 1-4, `left` 1-3). Neither
+branches on `apollo_test_be()` — one expected answer per width is the claim
+that the host no longer enters into it.

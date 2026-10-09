@@ -131,10 +131,17 @@ Sets a variable to a value or computed hash.
 - ``set [var]:crc64_ecma`` - CRC-64 ECMA 182
 - ``set [var]:adler32`` - Adler-32 checksum
 - ``set [var]:adler16`` - Adler-16 checksum
+- ``set [var]:fletcher16`` - Fletcher-16 checksum
+- ``set [var]:fletcher32`` - Fletcher-32 checksum
 - ``set [var]:crc`` - Custom CRC (configured via set ``crc_*``)
 - ``set [var]:md5_xor`` - XOR of MD5 hash bytes
 - ``set [var]:sha1_xor64`` - XOR of SHA-1 hash as 64-bit
 - ``set [var]:hmac_sha1(key)`` - HMAC-SHA1 with key
+
+Fletcher-32 sums 16-bit little-endian words, per its canonical definition, on
+every console -- the byte order is part of the algorithm, not of the save, so
+the same range yields the same value everywhere. An odd-length range
+contributes its last byte as the low half of a zero-padded word.
 
 **Checksum Functions:**
 
@@ -422,6 +429,55 @@ Sets the carry byte value for add() and wadd() operations.
 
     carry(2)    ; Sets 2 byte carry
 
+Save Wizard lines
+-----------------
+:doc:`Save Wizard codes <savewizard>` can be written straight into a BSD script,
+with no command around them.
+
+**Syntax:**
+
+.. code-block:: text
+
+    XXXXXXXX YYYYYYYY
+    ...
+
+Any line in the Save Wizard shape that is not a BSD command starts a run of Save
+Wizard lines. The run is every consecutive Save Wizard line from there, and it is
+applied as one Save Wizard code, on the save data as the script has left it at
+that point -- after any ``decrypt``, ``insert`` or ``delete`` before it. The
+first line that is not a Save Wizard line ends the run, and the script carries on
+from that line.
+
+- Each run starts with its own Save Wizard pointer at ``0``. It does not see
+  the BSD ``pointer``, ``range`` or variables.
+- A BSD line between Save Wizard lines splits them into two separate runs. A run
+  does not carry anything into the next one, including a pointer set by a search
+  code (type ``8``), so keep codes that depend on each other in the same run.
+- A multi-line Save Wizard code type must be complete within its run. If a BSD
+  line cuts it short, the whole code is rejected.
+- A ``[LE:...]`` or ``[BE:...]`` prefix on the BSD code applies to its Save
+  Wizard lines too.
+- ``{tag}`` options work in Save Wizard lines, as they do in the rest of the
+  script, and they are replaced before the line is read.
+- Leading spaces are allowed, and so are ``;`` comment lines inside a run.
+- Only lines in valid hex count. A line that isn't, such as one with an ``XX``
+  placeholder, ends the run and is then skipped like any other line BSD does not
+  recognise, so a placeholder in the middle splits a run in two and writes
+  nothing itself. A BSD command that happens to have the same shape, such as
+  ``write at 0x100:FF``, still runs as BSD.
+
+**Example:**
+
+.. code-block:: text
+
+    [Max Money + Fix Checksum]
+    decrypt aes_ecb("0123456789ABCDEF")
+    20000104 0098967F
+    set range:0x10,eof
+    set [csum]:crc32
+    write at 0x0C:[csum]
+    encrypt aes_ecb("0123456789ABCDEF")
+
 Encryption/Decryption Commands
 ==============================
 
@@ -579,8 +635,18 @@ Custom Encryption Algorithms
 
 .. code-block:: text
 
-    decrypt mgs_pw
-    encrypt mgs_pw
+    decrypt mgs_pw(type)
+    encrypt mgs_pw(type)
+
+**type:**
+
+- ``0`` : PS3 HD Edition (any region)
+- ``1`` : PSP US/EU -- ULUS10509, ULES01372
+- ``2`` : PSP JP digital -- NPJH50045
+
+The save type is not detected, it is declared: a PS3 save carries a second
+encrypted block a PSP save does not, and the PSP JP digital build shifts every
+offset down by ``0x10``.
 
 **Metal Gear Solid Base64:**
 

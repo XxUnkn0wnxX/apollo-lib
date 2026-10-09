@@ -1,5 +1,5 @@
 /*
- * Savepatch parsing vectors (load_patch_code_list / get_patch_code).
+ * Savepatch parsing vectors (apollo_load_code_list / get_patch_code).
  *
  * Parsing is endian-agnostic, so these are single-expectation tests that run
  * identically in the LE and BE builds. Input is assumed well-formed (per the
@@ -8,9 +8,12 @@
  *
  *   - `:file` headers set the target file for following codes
  *   - `[Name]` starts a code; the trailing `]` and ` ---` are stripped
- *   - code TYPE defaults to Save Wizard and flips to BSD as soon as any
- *     non-comment body line is not `XXXXXXXX YYYYYYYY`
- *   - `[DEFAULT:*]` -> activated, `[INFO:*]` -> ALERT, `[PYTHON:*]` -> Python
+ *   - code TYPE is inferred from the body -- Save Wizard only while every
+ *     non-comment line is `XXXXXXXX YYYYYYYY`, BSD from the first that is not
+ *     -- unless a header states it, and then the header wins
+ *   - `[DEFAULT:*]` -> activated, `[INFO:*]` -> ALERT, `[PYTHON:*]` -> Python,
+ *     `[SW:*]` -> Save Wizard, `[BSD:*]` -> BSD
+ *   - `[LE:*]` / `[BE:*]` -> ORDER_LE / ORDER_BE, leaving the type alone
  *   - `[GROUP:*]` -> PARENT, following codes -> CHILD
  *   - a name containing `(REQUIRED)` -> REQUIRED
  *   - a body with no code lines (comments only / empty) -> EMPTY
@@ -32,9 +35,21 @@ static list_t* parse(const char* text)
     header->file = strdup("header");
     list_append(list, header);
 
-    load_patch_code_list(buf, list, NULL, NULL);
+    apollo_load_code_list(buf, list, NULL, NULL);
     free(buf);   /* names/codes are strdup'd inside the parser */
     return list;
+}
+
+/* Teardown, the split apollo_free_code_list() documents: the loader's entries
+ * go back through the library, the caller-owned header by hand. */
+static void free_parsed(list_t* list)
+{
+    code_entry_t* header = list_get(list_head(list));
+
+    apollo_free_code_list(list, list_next(list_head(list)));
+    free(header->name);
+    free(header->file);
+    free(header);
 }
 
 static const char* SAMPLE =
@@ -103,7 +118,7 @@ TEST(parse_type_savewizard_vs_bsd)
 /*
  * The Save Wizard type is only assigned when EVERY body line is exactly
  * "XXXXXXXX YYYYYYYY" (17 chars) — the mask in loader.c has no trailing '*', so
- * wildcard_match requires a whole-string match. apply_sw_patch_code relies on
+ * wildcard_match requires a whole-string match. apollo_apply_sw_code relies on
  * this: it indexes each line at fixed offsets up to line[16].
  */
 TEST(parse_sw_type_requires_exact_line_width)
@@ -203,4 +218,323 @@ TEST(parse_empty_body_flag)
     code_entry_t* c = list_get_item(l, I_EMPTY);
 
     CHECK_U64("comment-only body -> EMPTY", (c->flags & APOLLO_CODE_FLAG_EMPTY) != 0, 1);
+}
+
+/*
+ * Interactive {TAG} options: the option block declares `value=Display` pairs,
+ * a code body referencing the tag gets a deep copy of them, and the selection
+ * starts at -1 — "not chosen", which is what makes the front-ends block Apply
+ * until the user picks rather than silently taking the first value.
+ *
+ * This is also the one shape that exercises every branch of
+ * apollo_free_code_list() (option array, value list, per-value strings), so
+ * the teardown runs here and an -fsanitize=address build covers it.
+ */
+TEST(parse_option_tag_values)
+{
+    list_t* l = parse(";CUSA00000\n"
+                      ";Option Sample\n"
+                      ":SAVE.DAT\n"
+                      "{Z}001=First;002=Second{/Z}\n"
+                      "[Pick a slot]\n"
+                      "20000004 000000{Z}\n");
+
+    code_entry_t* c = list_get_item(l, 1);
+    CHECK_U64("one {tag} in the body -> one option group", c->options_count, 1);
+    CHECK_STR("group keeps the tag verbatim, braces included", c->options[0].line, "{Z}");
+    CHECK_U64("both values parsed", list_count(c->options[0].opts), 2);
+    CHECK_U64("nothing selected yet", (int64_t)c->options[0].sel, (int64_t)-1);
+
+    option_value_t* first = list_get_item(c->options[0].opts, 0);
+    CHECK_STR("left of '=' is the substituted value", first->value, "001");
+    CHECK_STR("right of '=' is the display name", first->name, "First");
+
+    free_parsed(l);
+}
+
+/*
+ * A declared type beats the body's shape.
+ *
+ * Inference alone cannot be overridden, and it is not always right: a Save
+ * Wizard code with a single mistyped line reads as BSD and then fails, and a
+ * BSD script whose every line happens to be eight hex digits, a space and
+ * eight more reads as Save Wizard. No patch in the database declares a type
+ * yet, so these two cases exist nowhere else to test against.
+ */
+TEST(parse_declared_type_beats_body)
+{
+    list_t* l = parse(":F.BIN\n"
+                      "[SW:Mistyped but still Save Wizard]\n"
+                      "20000004 12345678\n"
+                      "20000008 1234567\n"        /* 16 chars: would infer BSD */
+                      "\n"
+                      "[BSD:Hex-shaped but still BSD]\n"
+                      "20000004 12345678\n"       /* would infer Save Wizard   */
+                      "\n"
+                      "[sw:lower case works too]\n"
+                      "set [x]:0\n");
+
+    CHECK_U64("[SW:*] survives a non-conforming line",
+              ((code_entry_t*)list_get_item(l, 1))->type, APOLLO_CODE_SAVEWIZARD);
+    CHECK_U64("[BSD:*] survives a conforming body",
+              ((code_entry_t*)list_get_item(l, 2))->type, APOLLO_CODE_BSD);
+    CHECK_U64("the prefix is case-insensitive",
+              ((code_entry_t*)list_get_item(l, 3))->type, APOLLO_CODE_SAVEWIZARD);
+
+    CHECK_STR("[SW:*] is stripped from the name",
+              ((code_entry_t*)list_get_item(l, 1))->name, "Mistyped but still Save Wizard");
+    CHECK_STR("[BSD:*] is stripped from the name",
+              ((code_entry_t*)list_get_item(l, 2))->name, "Hex-shaped but still BSD");
+
+    free_parsed(l);
+}
+
+/* A code the parser can infer nothing from still has to come back with a
+ * usable type: front-ends switch on it, and 0 is not one of the three. */
+TEST(parse_type_never_zero)
+{
+    list_t* l = parse(SAMPLE);
+    int zeros = 0;
+
+    for (size_t i = 1; i < list_count(l); i++)
+        if (((code_entry_t*)list_get_item(l, i))->type == 0) zeros++;
+
+    CHECK_U64("no parsed code has type 0", zeros, 0);
+    CHECK_U64("an empty body still reads as Save Wizard",
+              ((code_entry_t*)list_get_item(l, I_EMPTY))->type, APOLLO_CODE_SAVEWIZARD);
+
+    free_parsed(l);
+}
+
+/*
+ * Trailing blanks are the parser's problem, not the author's.
+ *
+ * Both of the loader's passes see lines that str_rtrim() has trimmed, so a
+ * stray tab used to have two very different consequences: after a title, the
+ * line matched no pattern and its code was never created (the text fell into
+ * the code above); after a code line, the extra character made the body stop
+ * looking like Save Wizard and the whole code was read as a BSD script.
+ * Hand-written patches in the database had both.
+ */
+TEST(parse_trailing_blanks_ignored)
+{
+    list_t* l = parse(":F.BIN\n"
+                      "[Tab after the title]\t\n"
+                      "20000004 12345678\n"
+                      "\n"
+                      "[Tab after a code line]\n"
+                      "20000004 12345678\t\n"
+                      "\n"
+                      "[Spaces after both]   \n"
+                      "20000004 12345678   \n");
+
+    CHECK_U64("a tabbed title still starts a code", list_count(l), 4);
+
+    code_entry_t* tabbed  = list_get_item(l, 1);
+    code_entry_t* tabline = list_get_item(l, 2);
+    code_entry_t* spaced  = list_get_item(l, 3);
+
+    CHECK_STR("the tab is not part of the name", tabbed->name, "Tab after the title");
+    CHECK_STR("nor are trailing spaces", spaced->name, "Spaces after both");
+
+    CHECK_U64("a tab after a code line -> still Save Wizard",
+              tabline->type, APOLLO_CODE_SAVEWIZARD);
+    CHECK_U64("spaces after a code line -> still Save Wizard",
+              spaced->type, APOLLO_CODE_SAVEWIZARD);
+
+    CHECK_STR("the body carries no trailing blank", tabline->codes, "20000004 12345678\n");
+
+    free_parsed(l);
+}
+
+/*
+ * Parsing into an EMPTY list.
+ *
+ * Every in-tree caller seeds the list with its own header node first (the game
+ * name row), and the parser leans on that: it marks list_tail() on entry and
+ * fills in what it appended after the mark. An empty list has no tail, so the
+ * mark was NULL and the pass that reads bodies never ran at all -- codes were
+ * appended with their names, and nothing else.
+ */
+TEST(parse_without_header_node)
+{
+    char*   buf = strdup(":F.BIN\n"
+                         "[First]\n"
+                         "20000004 12345678\n"
+                         "\n"
+                         "[Second]\n"
+                         "set [x]:0\n");
+    list_t* l = list_alloc();
+
+    int n = apollo_load_code_list(buf, l, NULL, NULL);
+    free(buf);
+
+    CHECK_U64("both codes parsed", list_count(l), 2);
+    CHECK_U64("the return value counts them", n, 2);
+
+    code_entry_t* first  = list_get_item(l, 0);
+    code_entry_t* second = list_get_item(l, 1);
+
+    CHECK_STR("first name", first->name, "First");
+    CHECK_STR("first body", first->codes, "20000004 12345678\n");
+    CHECK_U64("first type", first->type, APOLLO_CODE_SAVEWIZARD);
+
+    CHECK_STR("second name", second->name, "Second");
+    CHECK_STR("second body", second->codes, "set [x]:0\n");
+    CHECK_U64("second type", second->type, APOLLO_CODE_BSD);
+
+    /* No caller-owned node here, so every entry is the library's. */
+    apollo_free_code_list(l, list_head(l));
+}
+
+/*
+ * [LE:*] / [BE:*] set the byte-order flag, and only that.
+ *
+ * They read like the type prefixes and sit in the same slot, but they do a
+ * different job: apollo_apply_sw_code() takes APOLLO_CODE_FLAG_ORDER_* as an
+ * override of apollo_set_endianness() for that one code, while the TYPE still
+ * comes from the body. Nothing in the patches database uses them, so this is
+ * the only place the combination is exercised.
+ */
+TEST(parse_order_prefix)
+{
+    list_t* l = parse(":F.BIN\n"
+                      "[BE:Big endian]\n"
+                      "20000004 12345678\n"
+                      "\n"
+                      "[LE:Little endian]\n"
+                      "20000004 12345678\n"
+                      "\n"
+                      "[be:lower case works too]\n"
+                      "20000004 12345678\n"
+                      "\n"
+                      "[BE:Script]\n"           /* order prefix, BSD body */
+                      "set [x]:0\n"
+                      "\n"
+                      "[BE:DEFAULT:Only one prefix]\n"
+                      "20000004 12345678\n"
+                      "\n"
+                      "[No prefix]\n"
+                      "20000004 12345678\n");
+
+    code_entry_t* be     = list_get_item(l, 1);
+    code_entry_t* le     = list_get_item(l, 2);
+    code_entry_t* lower  = list_get_item(l, 3);
+    code_entry_t* script = list_get_item(l, 4);
+    code_entry_t* once   = list_get_item(l, 5);
+    code_entry_t* plain  = list_get_item(l, 6);
+
+    CHECK_U64("[BE:*] -> ORDER_BE", (be->flags & APOLLO_CODE_FLAG_ORDER_BE) != 0, 1);
+    CHECK_U64("[BE:*] leaves ORDER_LE clear", (be->flags & APOLLO_CODE_FLAG_ORDER_LE) != 0, 0);
+    CHECK_U64("[LE:*] -> ORDER_LE", (le->flags & APOLLO_CODE_FLAG_ORDER_LE) != 0, 1);
+    CHECK_U64("[LE:*] leaves ORDER_BE clear", (le->flags & APOLLO_CODE_FLAG_ORDER_BE) != 0, 0);
+    CHECK_U64("the prefix is case-insensitive",
+              (lower->flags & APOLLO_CODE_FLAG_ORDER_BE) != 0, 1);
+    CHECK_U64("no prefix -> neither flag",
+              (plain->flags & (APOLLO_CODE_FLAG_ORDER_LE | APOLLO_CODE_FLAG_ORDER_BE)) != 0, 0);
+
+    CHECK_STR("[BE:*] is stripped from the name", be->name, "Big endian");
+    CHECK_STR("[LE:*] is stripped from the name", le->name, "Little endian");
+
+    /* Unlike [SW:*]/[BSD:*], these state nothing about the type. */
+    CHECK_U64("a hex body under [BE:*] is still inferred Save Wizard",
+              be->type, APOLLO_CODE_SAVEWIZARD);
+    CHECK_U64("a script body under [BE:*] is still inferred BSD",
+              script->type, APOLLO_CODE_BSD);
+    CHECK_U64("and keeps the flag the engine ignores there",
+              (script->flags & APOLLO_CODE_FLAG_ORDER_BE) != 0, 1);
+
+    /* Prefixes compose: the order tag does not consume the title's one slot. */
+    CHECK_U64("a second prefix is consumed too", once->activated, 1);
+    CHECK_U64("and the first still applies", (once->flags & APOLLO_CODE_FLAG_ORDER_BE) != 0, 1);
+    CHECK_STR("both are stripped from the name", once->name, "Only one prefix");
+
+    free_parsed(l);
+}
+
+/*
+ * Title prefixes compose, in any order and any number.
+ *
+ * Each one is read off the front of the title and the next is tried against
+ * what is left, so "[BE:SW:Name]" is a big-endian Save Wizard code. Before
+ * this, a title carried exactly one: everything after the first prefix stayed
+ * in the name, and a code that was already [DEFAULT:*] or [INFO:*] had no way
+ * left to state its type -- the case the patch exporter had to report rather
+ * than fix.
+ */
+TEST(parse_prefixes_compose)
+{
+    list_t* l = parse(":F.BIN\n"
+                      "[BE:SW:Order and type]\n"
+                      "20000004 1234567\n"          /* 16 chars: would infer BSD */
+                      "\n"
+                      "[DEFAULT:BE:Ticked and big endian]\n"
+                      "20000004 12345678\n"
+                      "\n"
+                      "[INFO:PYTHON:Alert script]\n"
+                      "print('hi')\n"
+                      "\n"
+                      "[SW:BSD:Last type wins]\n"
+                      "20000004 12345678\n"
+                      "\n"
+                      "[LE:BE:Last order wins]\n"
+                      "20000004 12345678\n");
+
+    code_entry_t* both   = list_get_item(l, 1);
+    code_entry_t* deflt  = list_get_item(l, 2);
+    code_entry_t* info   = list_get_item(l, 3);
+    code_entry_t* type2  = list_get_item(l, 4);
+    code_entry_t* order2 = list_get_item(l, 5);
+
+    /* [BE:SW:*] -- the declared type survives a body that infers BSD */
+    CHECK_U64("[BE:SW:*] -> ORDER_BE", (both->flags & APOLLO_CODE_FLAG_ORDER_BE) != 0, 1);
+    CHECK_U64("[BE:SW:*] -> Save Wizard", both->type, APOLLO_CODE_SAVEWIZARD);
+    CHECK_STR("[BE:SW:*] name", both->name, "Order and type");
+
+    CHECK_U64("[DEFAULT:BE:*] activates", deflt->activated, 1);
+    CHECK_U64("[DEFAULT:BE:*] -> ORDER_BE", (deflt->flags & APOLLO_CODE_FLAG_ORDER_BE) != 0, 1);
+    CHECK_STR("[DEFAULT:BE:*] name", deflt->name, "Ticked and big endian");
+
+    /* The case the one-slot rule made unreachable: an alert that is Python. */
+    CHECK_U64("[INFO:PYTHON:*] -> ALERT", (info->flags & APOLLO_CODE_FLAG_ALERT) != 0, 1);
+    CHECK_U64("[INFO:PYTHON:*] -> Python", info->type, APOLLO_CODE_PYTHON);
+    CHECK_STR("[INFO:PYTHON:*] name", info->name, "Alert script");
+
+    /* Conflicts resolve to the last one written, for both kinds. */
+    CHECK_U64("[SW:BSD:*] -> BSD", type2->type, APOLLO_CODE_BSD);
+    CHECK_U64("[LE:BE:*] -> ORDER_BE", (order2->flags & APOLLO_CODE_FLAG_ORDER_BE) != 0, 1);
+    CHECK_U64("[LE:BE:*] leaves ORDER_LE clear",
+              (order2->flags & APOLLO_CODE_FLAG_ORDER_LE) != 0, 0);
+
+    free_parsed(l);
+}
+
+/* A group heading is not a prefix and does not compose: it names a heading
+   rather than a code, and its own forms are order-sensitive between
+   themselves, so it is read before the prefix loop and only once. */
+TEST(parse_group_is_not_a_prefix)
+{
+    list_t* l = parse(":F.BIN\n"
+                      "[GROUP:Plain group]\n"
+                      "20000004 12345678\n"
+                      "\n"
+                      "[GROUP:Parent\\Child]\n"
+                      "20000004 12345678\n"
+                      "\n"
+                      "[Follows the group]\n"
+                      "20000004 12345678\n");
+
+    code_entry_t* grp   = list_get_item(l, 1);
+    code_entry_t* sub   = list_get_item(l, 2);
+    code_entry_t* child = list_get_item(l, 3);
+
+    CHECK_U64("[GROUP:*] -> PARENT", (grp->flags & APOLLO_CODE_FLAG_PARENT) != 0, 1);
+    CHECK_STR("[GROUP:*] name", grp->name, "Plain group");
+    CHECK_U64("a backslash that is not right after GROUP: is just a name",
+              (sub->flags & APOLLO_CODE_FLAG_PARENT) != 0, 1);
+    CHECK_STR("and stays in the name", sub->name, "Parent\\Child");
+    CHECK_U64("the code after a group is a CHILD",
+              (child->flags & APOLLO_CODE_FLAG_CHILD) != 0, 1);
+
+    free_parsed(l);
 }

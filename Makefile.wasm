@@ -1,0 +1,189 @@
+# libapollo for WebAssembly (Emscripten).
+#
+# Produces a wasm32 static archive that a browser/Node front-end links against,
+# plus a test target that runs the tests/ suite under Node.
+#
+# Requires the Emscripten SDK on PATH (emcc, emar, emcmake). Check with
+# `emcc --version`; install via https://emscripten.org/docs/getting_started or
+# `brew install emscripten`.
+#
+#   make -f Makefile.wasm mbedtls   build the wasm libmbedcrypto (do this first)
+#   make -f Makefile.wasm           build build-wasm/libapollo.a
+#   make -f Makefile.wasm test      build + run the tests/ suite under Node
+#   make -f Makefile.wasm clean
+#
+# NOTE: the archive is built WITHOUT -DAPOLLO_CLI, so the engine emits progress
+# through dbglogger_log() and MicroPython print() through dbglogger_printf().
+# The embedder must define both (see core/apollo_ctrl.c in bucanero/apollo-patcher,
+# which routes them to a log sink) — this is what a UI front-end wants, and it
+# keeps stdout out of the picture entirely.
+#
+# LINK FLAGS THE EMBEDDER NEEDS (they belong to the final module, not the .a):
+#
+#   --use-port=zlib             the engine calls into zlib (offzip/packzip)
+#   -sSTACK_SIZE=4MB            Emscripten's 64KB default is BELOW MicroPython's
+#                               own 40KB stack limit (see micropy_create()) and
+#                               leaves nothing for parser recursion
+#   -sALLOW_MEMORY_GROWTH=1     apollo_apply_py_code() allocates a 64MB heap
+#   --embed-file <apollo-patches>/python@/python
+#                               Python patches import helper modules from
+#                               sys.path; with no host callback the engine looks
+#                               in "python" relative to the FS root. Those
+#                               modules live in bucanero/apollo-patches, not in
+#                               this repo (tools/python here, if you have it, is
+#                               an untracked local copy for CLI testing)
+#
+# The MicroPython path needs --spill-pointers, applied POST-LINK.
+#
+# MicroPython's GC scans the C stack conservatively (micropy_gc_collect() in
+# source/upy.c setjmp()s and walks from &regs up to vm.stack_top). Under wasm
+# that finds almost nothing: locals live in wasm locals, not in addressable
+# memory, so the shadow stack it can actually read held 1276 bytes for the
+# whole live VM call chain in a measured run. Live objects go unseen, get
+# swept, and the next free of one trips `assert(!"bad free")` in
+# micropy_gc_free() on a block already marked AT_FREE.
+#
+# -sBINARYEN_EXTRA_PASSES=--spill-pointers is the documented fix and it does
+# work -- but NOT passed that way, for two reasons that hide each other:
+#
+#   * the pass finds the stack pointer BY NAME, so it needs the names section.
+#     Built without -g the global is emitted as $global$0 and wasm-opt stops
+#     with "Fatal: getStackSpace: failed to find the stack pointer".
+#   * built WITH -g, emcc reports "running limited binaryen optimizations
+#     because DWARF info requested" and silently drops BINARYEN_EXTRA_PASSES,
+#     so the pass never runs and nothing says so.
+#
+# Hence the separate wasm-opt invocation in the `test` target below, against a
+# binary that kept its names. An embedder must do the same to its own module.
+#
+# Known limitation after all that: the conservative scan now sees every stale
+# pointer spilled to the shadow stack, so it retains aggressively. The Monster
+# Hunter World vector (an 8MB save) still exhausts the MicroPython heap and
+# raises MemoryError -- at PY_HEAP_SIZE and at 4x it. Every other Python vector
+# passes. A wasm front-end should expect the largest saves to need more heap
+# than the console builds do, or to fail cleanly rather than silently.
+
+TARGET    = build-wasm/libapollo.a
+OBJS      = $(addprefix build-wasm/,crc_util.o decrypt.o list.o loader.o offzip.o packzip.o \
+			patches.o wildcard.o upy.o)
+
+MBEDTLS   = mbedtls-2.16.12
+MBED_WASM = $(MBEDTLS)/build-wasm/library
+
+CC       = emcc
+AR       = emar
+
+# Resolve tools to a real executable instead of letting a recipe do a bare PATH
+# lookup, because two of the directories emsdk adds to PATH contain
+# SUBDIRECTORIES whose names collide with tools we run:
+#
+#   <emsdk>/upstream/emscripten/cmake   holds Emscripten.cmake
+#   <emsdk>/node                        holds the bundled Node install
+#
+# GNU make execs a simple recipe line itself rather than through a shell, and on
+# Linux its PATH search stops at that directory and fails with
+# "cmake: Permission denied" (make then reports Error 127). Shells are not
+# affected — they skip directories — which is why `emcmake cmake ...` succeeds
+# on the line above and the plain `cmake` on the next line does not, and why
+# this never reproduces on macOS.
+#
+# $(wildcard $(d)/$(1)/.) is non-empty only when $(d)/$(1) is a directory, so
+# this takes the first PATH entry holding a $(1) that is NOT one. Falls back to
+# the bare name so an genuinely missing tool still reports itself normally.
+find_exe = $(firstword $(foreach d,$(subst :, ,$(PATH)), \
+			  $(if $(wildcard $(d)/$(1)/.),,$(wildcard $(d)/$(1)))) $(1))
+
+CMAKE   ?= $(call find_exe,cmake)
+NODE    ?= $(call find_exe,node)
+# -Itools: types.h includes <dbglogger.h>; on consoles that comes from the
+# toolchain (bucanero/dbglogger), on PC/wasm tools/dbglogger.h is the prototype
+# stand-in, the same way the front-end builds do.
+CFLAGS   = -O2 -Wall -D_GNU_SOURCE -D_USE_MBEDTLS -Iinclude -I$(MBEDTLS)/include -Itools \
+			--use-port=zlib
+
+.PHONY: all mbedtls test clean
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(AR) rcs $@ $^
+	@echo "$@ built"
+
+build-wasm/%.o: source/%.c | build-wasm
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+build-wasm:
+	@mkdir -p $@
+
+# wasm libmbedcrypto, built out-of-tree so it cannot collide with the native
+# build in $(MBEDTLS)/build/library that tools/ and the front-ends link against.
+# CMAKE_POLICY_VERSION_MINIMUM: mbedtls 2.16's CMake predates CMake 4.
+mbedtls:
+	emcmake $(CMAKE) -S $(MBEDTLS) -B $(MBEDTLS)/build-wasm \
+		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release \
+		-DENABLE_TESTING=Off -DENABLE_PROGRAMS=Off -DUSE_STATIC_MBEDTLS_LIBRARY=On
+	$(CMAKE) --build $(MBEDTLS)/build-wasm --target mbedcrypto -j
+	@echo "$(MBED_WASM)/libmbedcrypto.a built"
+
+# Runs the same suite the native build runs, cross-compiled and executed by
+# Node. NODERAWFS gives the tests the real filesystem (they read fixtures/ and
+# write temp targets); a browser front-end uses MEMFS instead.
+# wasm-opt, for the --spill-pointers step. emsdk puts it on PATH; a Homebrew
+# emscripten keeps it in libexec/binaryen/bin next to emcc. Override WASM_OPT
+# if it lives somewhere else.
+# emsdk puts wasm-opt on PATH; a Homebrew emscripten keeps it in
+# libexec/binaryen/bin, reachable only after resolving the emcc symlink. Both
+# are tried. Override WASM_OPT if it lives anywhere else.
+#
+# Backticks rather than $(...) for the command substitution on purpose: inside
+# $(shell ...) make would read the closing paren as the end of its own call.
+EMCC_REAL := $(shell readlink -f `command -v emcc` 2>/dev/null || command -v emcc 2>/dev/null)
+
+WASM_OPT ?= $(firstword \
+			  $(shell command -v wasm-opt 2>/dev/null) \
+			  $(wildcard $(dir $(EMCC_REAL))../libexec/binaryen/bin/wasm-opt) \
+			  $(wildcard $(dir $(EMCC_REAL))../binaryen/bin/wasm-opt) \
+			  $(wildcard $(dir $(EMCC_REAL))../bin/wasm-opt) \
+			  $(wildcard $(dir $(EMCC_REAL))wasm-opt))
+
+# The features the linker emitted; wasm-opt has to be told the same set or it
+# refuses the module.
+WASM_FEATURES = --enable-bulk-memory --enable-bulk-memory-opt \
+				--enable-call-indirect-overlong --enable-multivalue \
+				--enable-mutable-globals --enable-nontrapping-float-to-int \
+				--enable-reference-types --enable-sign-ext
+
+TESTBIN = tests/test_apollo.js
+
+# Link, then spill. tests/Makefile builds with -g, which is what leaves the
+# names section in place for --spill-pointers to find __stack_pointer.
+$(TESTBIN):
+	@[ -f $(MBED_WASM)/libmbedcrypto.a ] || { \
+		echo "missing $(MBED_WASM)/libmbedcrypto.a — run: make -f Makefile.wasm mbedtls"; exit 2; }
+	$(MAKE) -C tests test_apollo.js \
+		CC=emcc \
+		MBED=../$(MBED_WASM) \
+		BUILD=build-wasm \
+		EXE=.js \
+		LIBZ= \
+		EXTRA_CFLAGS="--use-port=zlib" \
+		EXTRA_LDFLAGS="-sNODERAWFS=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB -sEXIT_RUNTIME=1"
+	@[ -x "$(WASM_OPT)" ] || { echo "wasm-opt not found; set WASM_OPT=/path/to/wasm-opt"; exit 2; }
+	$(WASM_OPT) --spill-pointers tests/test_apollo.wasm -o tests/test_apollo.wasm $(WASM_FEATURES)
+	@echo "tests/test_apollo.wasm: --spill-pointers applied"
+
+test: $(TESTBIN)
+	$(MAKE) -C tests check \
+		CC=emcc \
+		MBED=../$(MBED_WASM) \
+		BUILD=build-wasm \
+		EXE=.js \
+		RUN=$(NODE) \
+		LIBZ= \
+		EXTRA_CFLAGS="--use-port=zlib" \
+		EXTRA_LDFLAGS="-sNODERAWFS=1 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=4MB -sEXIT_RUNTIME=1"
+
+clean:
+	@rm -rf build-wasm $(MBEDTLS)/build-wasm
+	@$(MAKE) -C tests clean EXE=.js BUILD=build-wasm
+	@echo "Cleaned up!"
