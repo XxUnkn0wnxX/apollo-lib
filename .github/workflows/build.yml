@@ -7,11 +7,11 @@ on:
   pull_request:
     branches:
       - develop
-  workflow_dispatch:
+  repository_dispatch:
+    types: [run_build]
 
 jobs:
   build:
-    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/develop' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
